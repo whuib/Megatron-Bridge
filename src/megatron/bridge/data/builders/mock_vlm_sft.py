@@ -49,6 +49,10 @@ class MockVLMSFTDatasetConfig(DataloaderConfig):
     random_seed: int = 0
     image_size: tuple[int, int] = (256, 256)
     num_images: int = 1
+    # Synthetic audio clips (white noise) for audio-capable processors such as Qwen3-Omni.
+    num_audios: int = 0
+    audio_seconds: float = 10.0
+    audio_sampling_rate: int = 16000
     num_base_examples: int = 1000
     skip_getting_attention_mask_from_dataset: bool = True
     dataloader_type: Literal["single", "cyclic"] | None = "single"
@@ -70,6 +74,10 @@ class MockVLMSFTDatasetConfig(DataloaderConfig):
             raise ValueError("image_size must contain two positive dimensions.")
         if self.num_images < 0:
             raise ValueError("num_images must be greater than or equal to 0.")
+        if self.num_audios < 0:
+            raise ValueError("num_audios must be greater than or equal to 0.")
+        if self.num_audios and (self.audio_seconds <= 0 or self.audio_sampling_rate <= 0):
+            raise ValueError("audio_seconds and audio_sampling_rate must be positive when num_audios > 0.")
         if self.num_base_examples <= 0:
             raise ValueError("num_base_examples must be greater than 0.")
         if self.pad_to_multiple_of <= 0:
@@ -88,13 +96,17 @@ def make_mock_vlm_example(
     rng: numpy.random.Generator,
     response_text: str,
 ) -> dict[str, Any]:
-    """Create one synthetic conversation with the configured number of images."""
+    """Create one synthetic conversation with the configured images and audio clips."""
     width, height = config.image_size
     images = [
         Image.fromarray(rng.integers(low=0, high=256, size=(height, width, 3), dtype=numpy.uint8), mode="RGB")
         for _ in range(config.num_images)
     ]
     content = [{"type": "image", "image": image} for image in images]
+    samples = int(round(config.audio_seconds * config.audio_sampling_rate))
+    for _ in range(config.num_audios):
+        clip = (0.1 * rng.standard_normal(samples)).astype(numpy.float32)
+        content.append({"type": "audio", "audio": clip})
     content.append({"type": "text", "text": config.prompt})
     return {
         "conversation": [

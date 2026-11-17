@@ -51,6 +51,8 @@ class Qwen3OmniModel(MegatronModule):
 
         self.pre_process = pre_process
         self.post_process = post_process
+        # Bridge's training loop reads the process groups from the outermost model module.
+        self.pg_collection = pg_collection
 
         self.thinker = Qwen3OmniThinkerModel(
             language_transformer_config,

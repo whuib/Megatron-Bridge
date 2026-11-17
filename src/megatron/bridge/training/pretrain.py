@@ -71,6 +71,13 @@ def pretrain(
         This is an experimental API and is subject to change in backwards
         incompatible ways without notice.
     """
+    multiplexing = getattr(config.model, "multiplexing", None)
+    if multiplexing is not None and multiplexing.use_multiplexing:
+        from megatron.bridge.training.multiplexing.runtime import pretrain_multiplexing
+
+        pretrain_multiplexing(config, forward_step_func, callbacks=callbacks)
+        return
+
     # Apply runtime config updates prior to creating/attaching GlobalState
     runtime_config_update(config)
 

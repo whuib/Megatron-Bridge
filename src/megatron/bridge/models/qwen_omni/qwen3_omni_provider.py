@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Literal
 
 import torch.nn.functional as F
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -40,6 +40,8 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.model import Qwen3OmniModel
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import Qwen3VLSelfAttention
+from megatron.bridge.models.qwen_vl.qwen3_vl_provider import DistTrainConfig
+from megatron.bridge.training.multiplexing.config import MultiplexingConfig
 
 
 def _bool_config_enabled(value) -> bool:
@@ -137,6 +139,16 @@ class Qwen3OmniModelProvider(GPTModelProvider):
     freeze_audio_model: bool = False
     vit_gradient_checkpointing: bool = False
     multimodal_attn_impl: str = "auto"
+    # Vision and audio towers: the Hugging Face modules (every TP rank holds a full copy) or
+    # Megatron implementations of the same functions that shard over the towers' TP group.
+    encoder_implementation: Literal["huggingface", "megatron"] = "huggingface"
+
+    # Encoder/language placement. DistTrain puts the vision+audio towers and the language model on
+    # disjoint ranks; multiplexing runs them on every rank with independent layouts. Both are opt-in.
+    dist_train: DistTrainConfig = field(default_factory=DistTrainConfig)
+    multiplexing: MultiplexingConfig = field(default_factory=MultiplexingConfig)
+    add_encoder: bool = True
+    add_decoder: bool = True
 
     def provide(self, pre_process=None, post_process=None, vp_stage=None):
         pp_group = self._pg_collection.pp if self._pg_collection is not None else None
@@ -184,6 +196,8 @@ class Qwen3OmniModelProvider(GPTModelProvider):
             code2wav_transformer_config=self.code2wav_config,
             pre_process=pre_process,
             post_process=post_process,
+            add_encoder=self.add_encoder,
+            add_decoder=self.add_decoder,
             pg_collection=self._pg_collection,
         )
 

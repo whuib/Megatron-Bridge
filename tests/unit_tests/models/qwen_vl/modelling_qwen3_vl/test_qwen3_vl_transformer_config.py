@@ -220,6 +220,19 @@ def test_vision_recompute_missing_fields_preserve_inheritance():
     assert config.recompute_num_layers == 2
 
 
+@pytest.mark.parametrize("provider_name", ["Qwen3VLModelProvider", "Qwen3VLMoEModelProvider"])
+def test_qwen3_vl_providers_expose_inheriting_vision_recompute(provider_name):
+    from dataclasses import fields
+
+    from megatron.bridge.models.qwen_vl import qwen3_vl_provider
+
+    defaults = {item.name: item.default for item in fields(getattr(qwen3_vl_provider, provider_name))}
+    # Same contract as Qwen3.5-VL: inherit the decoder policy unless a vision policy is set.
+    assert defaults["vision_recompute_granularity"] == "inherit"
+    for name in ("vision_recompute_method", "vision_recompute_num_layers", "vision_recompute_modules"):
+        assert defaults[name] is None
+
+
 @pytest.mark.parametrize("implementation", ["transformer_engine", "local", "local_transformer_engine"])
 @pytest.mark.parametrize("granularity", ["inherit", "full"])
 def test_full_vision_recompute_rejects_per_layer_vision_graphs(implementation, granularity):

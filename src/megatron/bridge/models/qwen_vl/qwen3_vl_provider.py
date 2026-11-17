@@ -21,7 +21,7 @@ Reference: https://huggingface.co/Qwen/Qwen3-VL-30B-A3B-Instruct
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -30,6 +30,7 @@ from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLM
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+from megatron.bridge.training.multiplexing.config import MultiplexingConfig
 
 
 @dataclass
@@ -119,9 +120,16 @@ class Qwen3VLModelProvider(GPTModelProvider):
     use_hf_vision_model: bool = False
 
     vision_dp_when_cp: bool = False
+    # Vision-encoder activation recompute, independent of the language policy (same contract as
+    # Qwen3.5-VL). "inherit" keeps the legacy behavior of reusing the decoder policy; None disables it.
+    vision_recompute_granularity: Literal["inherit", "full", "selective"] | None = "inherit"
+    vision_recompute_method: Literal["uniform", "block"] | None = None
+    vision_recompute_num_layers: int | None = None
+    vision_recompute_modules: list[str] | None = None
 
     # It’s an experimental feature and may change in the future.
     dist_train: DistTrainConfig = field(default_factory=DistTrainConfig)
+    multiplexing: MultiplexingConfig = field(default_factory=MultiplexingConfig)
     add_encoder: bool = True
     add_decoder: bool = True
 
@@ -285,9 +293,16 @@ class Qwen3VLMoEModelProvider(GPTModelProvider):
 
     use_hf_vision_model: bool = False
     vision_dp_when_cp: bool = False
+    # Vision-encoder activation recompute, independent of the language policy (same contract as
+    # Qwen3.5-VL). "inherit" keeps the legacy behavior of reusing the decoder policy; None disables it.
+    vision_recompute_granularity: Literal["inherit", "full", "selective"] | None = "inherit"
+    vision_recompute_method: Literal["uniform", "block"] | None = None
+    vision_recompute_num_layers: int | None = None
+    vision_recompute_modules: list[str] | None = None
 
     # It’s an experimental feature and may change in the future.
     dist_train: DistTrainConfig = field(default_factory=DistTrainConfig)
+    multiplexing: MultiplexingConfig = field(default_factory=MultiplexingConfig)
     add_encoder: bool = True
     add_decoder: bool = True
 

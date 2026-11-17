@@ -1458,6 +1458,9 @@ class ConfigContainer(Container):
         Ensures compatibility between different configuration settings.
         """
         _validate_and_sync_distributed_optimizer_settings(self)
+        multiplexing = getattr(self.model, "multiplexing", None)
+        if multiplexing is not None:
+            multiplexing.validate(self)
         if self.optimizer.optimizer not in ("adam", "sgd") and (
             self.ddp.use_megatron_fsdp or self.dist.use_torch_fsdp2
         ):

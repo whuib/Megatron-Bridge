@@ -1,0 +1,31 @@
+# Legal 8-GPU layouts for the Qwen3-VL throughput comparison (run_throughput_comparison.sh CASES_FILE).
+# Workload assumed: 12 language layers, GBS 32, MBS 2 (16 micro-batches), and 12 images per
+# sample (24 per micro-batch, divisible by every vision-DP / language-DP ratio below).
+# Format: <name> <mode> <layout args>. Language TP > 1 always uses sequence parallelism.
+
+# Native: vision runs inside the first language pipeline stage with the language TP and DP.
+nat_t1p1 native --language-tp 1 --language-pp 1
+nat_t1p2 native --language-tp 1 --language-pp 2
+nat_t1p4 native --language-tp 1 --language-pp 4
+nat_t2p1 native --language-tp 2 --language-pp 1 --sequence-parallel
+nat_t2p2 native --language-tp 2 --language-pp 2 --sequence-parallel
+nat_t4p1 native --language-tp 4 --language-pp 1 --sequence-parallel
+
+# DistTrain: <vision GPUs><language GPUs>. Vision DP must be a multiple of language DP.
+dt44_t1p1 disttrain --vision-gpus 4 --encoder-tp 1 --language-tp 1 --language-pp 1
+dt44_t1p2 disttrain --vision-gpus 4 --encoder-tp 1 --language-tp 1 --language-pp 2
+dt44_t2p1 disttrain --vision-gpus 4 --encoder-tp 1 --language-tp 2 --language-pp 1 --sequence-parallel
+dt62_t1p1 disttrain --vision-gpus 6 --encoder-tp 1 --language-tp 1 --language-pp 1
+dt62_t1p2 disttrain --vision-gpus 6 --encoder-tp 1 --language-tp 1 --language-pp 2
+dt62_t2p1 disttrain --vision-gpus 6 --encoder-tp 1 --language-tp 2 --language-pp 1 --sequence-parallel
+dt26_t1p3 disttrain --vision-gpus 2 --encoder-tp 1 --language-tp 1 --language-pp 3
+dt26_t2p3 disttrain --vision-gpus 2 --encoder-tp 1 --language-tp 2 --language-pp 3 --sequence-parallel
+
+# Multiplexing: language layout plus an independent encoder TP on the same 8 GPUs.
+mux_t1p1_e1 multiplexing --language-tp 1 --language-pp 1 --encoder-tp 1
+mux_t1p2_e1 multiplexing --language-tp 1 --language-pp 2 --encoder-tp 1
+mux_t1p2_e2 multiplexing --language-tp 1 --language-pp 2 --encoder-tp 2
+mux_t1p4_e1 multiplexing --language-tp 1 --language-pp 4 --encoder-tp 1
+mux_t2p1_e1 multiplexing --language-tp 2 --language-pp 1 --encoder-tp 1 --sequence-parallel
+mux_t2p1_e2 multiplexing --language-tp 2 --language-pp 1 --encoder-tp 2 --sequence-parallel
+mux_t2p2_e1 multiplexing --language-tp 2 --language-pp 2 --encoder-tp 1 --sequence-parallel

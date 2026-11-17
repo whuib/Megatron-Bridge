@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import deque
+from dataclasses import dataclass
+
 import torch
 from megatron.core import InferenceParams, tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -28,6 +31,10 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeVisionEncoder as Qwen3OmniMoeVisionEncoderHF,
 )
 
+from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.megatron_encoders import (
+    Qwen3OmniAudioEncoder,
+    Qwen3OmniVisionEncoder,
+)
 from megatron.bridge.models.qwen_omni.modeling_qwen3_omni.rope import (
     _get_feat_extract_output_lengths,
     get_rope_index,
@@ -125,6 +132,11 @@ def _trim_feature_sequence(
     return trimmed_features, trimmed_multiscale
 
 
+def _audio_embeddings(outputs: object) -> torch.Tensor:
+    """Audio tower output: a tensor (Megatron tower) or a Hugging Face output's ``last_hidden_state``."""
+    return outputs if isinstance(outputs, torch.Tensor) else outputs.last_hidden_state
+
+
 def _normalize_visual_outputs(outputs: object) -> tuple[torch.Tensor, list[torch.Tensor]]:
     def _as_feature_list(features: object) -> list[torch.Tensor]:
         if features is None:
@@ -153,6 +165,55 @@ def _normalize_visual_outputs(outputs: object) -> tuple[torch.Tensor, list[torch
     else:
         deepstack_features = outputs[1:]
     return hidden_states, _as_feature_list(deepstack_features)
+
+
+@dataclass
+class OmniEncoderFeatures:
+    """Encoder outputs for one micro-batch, produced outside the language model.
+
+    DistTrain encoder ranks and the multiplexing encoder replicas run the vision and audio
+    towers; the decoder-only first stage consumes these features in place of its own towers.
+    ``audio_embeds`` holds every produced audio token, before per-sample placeholder trimming.
+    """
+
+    vision_embeds: torch.Tensor | None
+    deepstack_embeds: list[torch.Tensor]
+    audio_embeds: torch.Tensor | None
+
+
+def _image_chunk_bounds(grid_thw: torch.Tensor, num_chunks: int, index: int) -> tuple[int, int, int, int]:
+    """Return (first image, end image, first patch row, end patch row) of one equal image chunk."""
+    n_images = int(grid_thw.shape[0])
+    if n_images % num_chunks:
+        raise ValueError(f"{n_images} images per micro-batch cannot be split into {num_chunks} equal encoder shards")
+    per_chunk = n_images // num_chunks
+    rows = grid_thw.prod(dim=-1).tolist()
+    start, end = index * per_chunk, (index + 1) * per_chunk
+    return start, end, int(sum(rows[:start])), int(sum(rows[:end]))
+
+
+def _audio_chunk_bounds(n_clips: int, num_chunks: int, index: int) -> tuple[int, int]:
+    """Return the clip range of one equal audio chunk."""
+    if n_clips % num_chunks:
+        raise ValueError(
+            f"{n_clips} audio clips per micro-batch cannot be split into {num_chunks} equal encoder shards"
+        )
+    per_chunk = n_clips // num_chunks
+    return index * per_chunk, (index + 1) * per_chunk
+
+
+def flatten_audio_features(
+    input_features: torch.Tensor, feature_attention_mask: torch.Tensor | None, audio_feature_lengths: torch.Tensor
+) -> torch.Tensor:
+    """Concatenate the valid mel frames of every clip into the encoder's ``[mel, frames]`` input."""
+    if feature_attention_mask is not None:
+        return input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+    if input_features.dim() == 2:
+        return input_features
+    frames = [
+        clip[:, : int(length)] for clip, length in zip(input_features, audio_feature_lengths.tolist(), strict=True)
+    ]
+    return torch.cat(frames, dim=1)
 
 
 class Qwen3OmniThinkerModel(MegatronModule):
@@ -196,7 +257,39 @@ class Qwen3OmniThinkerModel(MegatronModule):
         self.seconds_per_chunk = language_transformer_config.seconds_per_chunk
         self.thinker_transformer_config = thinker_transformer_config
 
-        if self.pre_process:
+        dist_train = getattr(language_transformer_config, "dist_train", None)
+        self.use_dist_train = bool(getattr(dist_train, "use_dist_train", False))
+        if self.use_dist_train:
+            if add_encoder == add_decoder:
+                raise ValueError(
+                    "Qwen3-Omni DistTrain places the encoders and the language model on disjoint ranks; "
+                    f"got add_encoder={add_encoder}, add_decoder={add_decoder}"
+                )
+            self.vision_to_llm_dp_ratio = int(dist_train.vision_to_llm_dp_ratio)
+        # Features for the decoder-only first stage, one entry per micro-batch in schedule order.
+        self.external_features: deque[OmniEncoderFeatures] = deque()
+        self._dist_train_received: torch.Tensor | None = None
+        self._current_features: OmniEncoderFeatures | None = None
+        self.n_deepstack = len(getattr(thinker_transformer_config.vision_config, "deepstack_visual_indexes", ()) or ())
+
+        encoder_implementation = getattr(language_transformer_config, "encoder_implementation", "huggingface")
+        if encoder_implementation not in ("huggingface", "megatron"):
+            raise ValueError(f"unknown Qwen3-Omni encoder_implementation {encoder_implementation!r}")
+        if self.pre_process and self.add_encoder and encoder_implementation == "megatron":
+            # Tensor-parallel towers over this model's TP group (language TP natively, the encoder TP
+            # of DistTrain encoder ranks or the multiplexing encoder module).
+            groups = pg_collection if pg_collection is not None else ProcessGroupCollection.use_mpu_process_groups()
+            self.visual = Qwen3OmniVisionEncoder(
+                thinker_transformer_config.vision_config, language_transformer_config, groups
+            )
+            self.audio_model = Qwen3OmniAudioEncoder(
+                thinker_transformer_config.audio_config, language_transformer_config, groups
+            )
+            if getattr(language_transformer_config, "vit_gradient_checkpointing", False):
+                raise ValueError(
+                    "vit_gradient_checkpointing applies to the Hugging Face towers; use vision recompute settings"
+                )
+        elif self.pre_process and self.add_encoder:
             multimodal_attn_impl = getattr(language_transformer_config, "multimodal_attn_impl", "auto")
             _configure_multimodal_attn_impl(thinker_transformer_config.vision_config, multimodal_attn_impl)
             _configure_multimodal_attn_impl(thinker_transformer_config.audio_config, multimodal_attn_impl)
@@ -217,6 +310,11 @@ class Qwen3OmniThinkerModel(MegatronModule):
             if getattr(language_transformer_config, "vit_gradient_checkpointing", False):
                 _enable_multimodal_gradient_checkpointing(self.visual)
                 _enable_multimodal_gradient_checkpointing(self.audio_model)
+
+        if not self.add_decoder:
+            # Encoder-only replica (DistTrain encoder ranks, multiplexing encoder module).
+            self.share_embeddings_and_output_weights = False
+            return
 
         self.language_model = Qwen3VLGPTModel(
             config=language_transformer_config,
@@ -244,6 +342,19 @@ class Qwen3OmniThinkerModel(MegatronModule):
         return None
 
     def set_input_tensor(self, input_tensor) -> None:
+        if self.use_dist_train:
+            if not isinstance(input_tensor, list) or len(input_tensor) != 1:
+                raise ValueError(f"DistTrain expects a one-element input list, got {type(input_tensor)}")
+            received = input_tensor[0]
+            if received is None:
+                return
+            if not isinstance(received, dict):
+                raise ValueError(f"DistTrain input must be a module-name dictionary, got {type(received)}")
+            if "vision_module" in received:
+                self._dist_train_received = received["vision_module"]
+            if "language_module" in received:
+                self.language_model.set_input_tensor(received["language_module"])
+            return
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
         assert len(input_tensor) == 1, "input_tensor should only be length 1 for Qwen3Omni"
@@ -304,6 +415,11 @@ class Qwen3OmniThinkerModel(MegatronModule):
         pixel_values: torch.FloatTensor,
         image_grid_thw: torch.LongTensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if self.visual is None:
+            features = self._current_features
+            if features is None or features.vision_embeds is None:
+                raise RuntimeError("decoder-only Qwen3-Omni stage has no external image features for this micro-batch")
+            return features.vision_embeds, list(features.deepstack_embeds)
         target_dtype = getattr(self.visual, "dtype", pixel_values.dtype)
         image_outputs = self.visual(pixel_values.to(dtype=target_dtype), grid_thw=image_grid_thw)
         return _normalize_visual_outputs(image_outputs)
@@ -313,6 +429,10 @@ class Qwen3OmniThinkerModel(MegatronModule):
         pixel_values_videos: torch.FloatTensor,
         video_grid_thw: torch.LongTensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        if self.visual is None:
+            raise NotImplementedError(
+                "decoupled Qwen3-Omni encoders (DistTrain/multiplexing) support images, not video"
+            )
         target_dtype = getattr(self.visual, "dtype", pixel_values_videos.dtype)
         video_outputs = self.visual(pixel_values_videos.to(dtype=target_dtype), grid_thw=video_grid_thw)
         return _normalize_visual_outputs(video_outputs)
@@ -331,21 +451,34 @@ class Qwen3OmniThinkerModel(MegatronModule):
         if audio_feature_lengths is None:
             raise ValueError("Either feature_attention_mask or audio_feature_lengths must be provided")
 
-        target_dtype = getattr(self.audio_model, "dtype", input_features.dtype)
-        audio_outputs = self.audio_model(
-            input_features.to(dtype=target_dtype),
-            feature_lens=audio_feature_lengths,
-        )
-        audio_embeds = audio_outputs.last_hidden_state
+        if self.audio_model is None:
+            features = self._current_features
+            if features is None or features.audio_embeds is None:
+                raise RuntimeError("decoder-only Qwen3-Omni stage has no external audio features for this micro-batch")
+            audio_embeds = features.audio_embeds
+            n_window = getattr(self.thinker_transformer_config.audio_config, "n_window", 50)
+        else:
+            target_dtype = getattr(self.audio_model, "dtype", input_features.dtype)
+            audio_outputs = self.audio_model(
+                input_features.to(dtype=target_dtype),
+                feature_lens=audio_feature_lengths,
+            )
+            audio_embeds = _audio_embeddings(audio_outputs)
+            n_window = getattr(self.thinker_transformer_config.audio_config, "n_window", 50)
 
         if expected_audio_token_counts is None:
             return audio_embeds
 
-        produced_output_lengths = _get_feat_extract_output_lengths(
-            audio_feature_lengths,
-            getattr(self.audio_model.config, "n_window", 50),
-        )
+        produced_output_lengths = _get_feat_extract_output_lengths(audio_feature_lengths, n_window)
         expected_audio_token_counts = expected_audio_token_counts.to(produced_output_lengths.device)
+        if produced_output_lengths.numel() != expected_audio_token_counts.numel():
+            # Several clips per sample: per-clip trimming is ambiguous, so require exact placeholder counts.
+            if int(produced_output_lengths.sum()) != int(expected_audio_token_counts.sum()):
+                raise ValueError(
+                    "Audio placeholders do not match produced audio tokens with several clips per sample: "
+                    f"expected={int(expected_audio_token_counts.sum())}, produced={int(produced_output_lengths.sum())}"
+                )
+            return audio_embeds
 
         trimmed_embeds = []
         start = 0
@@ -362,6 +495,111 @@ class Qwen3OmniThinkerModel(MegatronModule):
 
         return (
             torch.cat(trimmed_embeds, dim=0) if trimmed_embeds else audio_embeds.new_zeros((0, audio_embeds.shape[-1]))
+        )
+
+    def encode_multimodal(
+        self,
+        *,
+        pixel_values: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+        audio_features: torch.Tensor | None,
+        audio_feature_lengths: torch.Tensor | None,
+    ) -> OmniEncoderFeatures:
+        """Run the vision and audio towers on already sharded inputs.
+
+        ``audio_features`` is the flattened ``[mel, frames]`` encoder input (see
+        :func:`flatten_audio_features`). Used by encoder-only replicas.
+        """
+        vision_embeds, deepstack = None, []
+        if pixel_values is not None and pixel_values.shape[0] > 0:
+            vision_embeds, deepstack = self.get_image_features(pixel_values, image_grid_thw)
+        audio_embeds = None
+        if audio_features is not None and audio_feature_lengths is not None and audio_feature_lengths.numel() > 0:
+            target_dtype = getattr(self.audio_model, "dtype", audio_features.dtype)
+            audio_embeds = _audio_embeddings(
+                self.audio_model(audio_features.to(dtype=target_dtype), feature_lens=audio_feature_lengths)
+            )
+        return OmniEncoderFeatures(vision_embeds, deepstack, audio_embeds)
+
+    def _dist_train_encode(
+        self,
+        pixel_values: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+        input_features: torch.Tensor | None,
+        feature_attention_mask: torch.Tensor | None,
+        audio_feature_lengths: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        """Encode this encoder rank's equal shard of the language micro-batch and pack it."""
+        ratio = self.vision_to_llm_dp_ratio
+        index = self.pg_collection.dp.rank() % ratio
+        shard_pixels = shard_grid = None
+        if pixel_values is not None:
+            first, end, row_start, row_end = _image_chunk_bounds(image_grid_thw, ratio, index)
+            shard_pixels, shard_grid = pixel_values[row_start:row_end], image_grid_thw[first:end]
+        shard_audio = shard_lengths = None
+        if input_features is not None:
+            lengths = audio_feature_lengths
+            if lengths is None:
+                lengths = feature_attention_mask.sum(dim=1)
+            first, end = _audio_chunk_bounds(int(lengths.numel()), ratio, index)
+            mask = feature_attention_mask[first:end] if feature_attention_mask is not None else None
+            shard_lengths = lengths[first:end]
+            shard_audio = flatten_audio_features(input_features[first:end], mask, shard_lengths)
+        features = self.encode_multimodal(
+            pixel_values=shard_pixels,
+            image_grid_thw=shard_grid,
+            audio_features=shard_audio,
+            audio_feature_lengths=shard_lengths,
+        )
+        parts = []
+        if features.vision_embeds is not None:
+            parts.extend([features.vision_embeds, *features.deepstack_embeds])
+        if features.audio_embeds is not None:
+            parts.append(features.audio_embeds)
+        if not parts:
+            raise ValueError("DistTrain Qwen3-Omni encoder ranks require image or audio inputs")
+        # The multi-module communicator moves 3D [batch, rows, hidden] tensors; fan-in stacks shards on dim 0.
+        return {"vision_module": torch.cat(parts, dim=0).unsqueeze(0)}
+
+    def _dist_train_unpack(
+        self, image_grid_thw: torch.Tensor | None, audio_feature_lengths: torch.Tensor | None
+    ) -> OmniEncoderFeatures:
+        """Split the encoder ranks' packed shards back into vision, DeepStack and audio features."""
+        received = self._dist_train_received
+        self._dist_train_received = None
+        if received is None:
+            raise RuntimeError("DistTrain language stage did not receive encoder features for this micro-batch")
+        ratio = self.vision_to_llm_dp_ratio
+        hidden = received.shape[-1]
+        shards = received.reshape(ratio, -1, hidden)
+        merge = self.config.spatial_merge_size**2
+        n_window = getattr(self.thinker_transformer_config.audio_config, "n_window", 50)
+        vision, deepstack, audio = [], [[] for _ in range(self.n_deepstack)], []
+        for index in range(ratio):
+            vision_rows = 0
+            if image_grid_thw is not None:
+                first, end, _, _ = _image_chunk_bounds(image_grid_thw, ratio, index)
+                vision_rows = int(image_grid_thw[first:end].prod(dim=-1).sum()) // merge
+            audio_rows = 0
+            if audio_feature_lengths is not None:
+                first, end = _audio_chunk_bounds(int(audio_feature_lengths.numel()), ratio, index)
+                audio_rows = int(_get_feat_extract_output_lengths(audio_feature_lengths[first:end], n_window).sum())
+            vision_block = vision_rows * (1 + self.n_deepstack) if vision_rows else 0
+            if shards.shape[1] != vision_block + audio_rows:
+                raise ValueError(
+                    f"DistTrain encoder shard {index} has {shards.shape[1]} rows, expected {vision_block + audio_rows}"
+                )
+            shard = shards[index]
+            if vision_rows:
+                vision.append(shard[:vision_rows])
+                for k in range(self.n_deepstack):
+                    deepstack[k].append(shard[vision_rows * (1 + k) : vision_rows * (2 + k)])
+            if audio_rows:
+                audio.append(shard[vision_block:])
+        return OmniEncoderFeatures(
+            torch.cat(vision) if vision else None,
+            [torch.cat(parts) for parts in deepstack] if vision else [],
+            torch.cat(audio) if audio else None,
         )
 
     def forward(
@@ -397,6 +635,20 @@ class Qwen3OmniThinkerModel(MegatronModule):
 
         if audio_feature_lengths is None and feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+
+        if self.language_model is None:
+            if not self.use_dist_train:
+                raise RuntimeError("an encoder-only Qwen3-Omni replica is driven through encode_multimodal()")
+            return self._dist_train_encode(
+                pixel_values, image_grid_thw, input_features, feature_attention_mask, audio_feature_lengths
+            )
+        if self.pre_process and self.visual is None:
+            if self.use_dist_train:
+                self._current_features = self._dist_train_unpack(image_grid_thw, audio_feature_lengths)
+            elif self.external_features:
+                self._current_features = self.external_features.popleft()
+            else:
+                raise RuntimeError("decoder-only Qwen3-Omni first stage has no queued encoder features")
 
         if position_ids is None:
             has_multimodal_inputs = any(
@@ -575,7 +827,8 @@ class Qwen3OmniThinkerModel(MegatronModule):
                 sequence_parallel=self.config.sequence_parallel,
             )
 
-        return self.language_model(
+        self._current_features = None
+        output = self.language_model(
             input_ids=None if combined_embeddings is not None else input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -589,3 +842,6 @@ class Qwen3OmniThinkerModel(MegatronModule):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
+        if self.use_dist_train and not self.post_process:
+            return {"language_module": output}
+        return output

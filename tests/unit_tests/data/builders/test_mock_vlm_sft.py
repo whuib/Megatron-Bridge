@@ -63,6 +63,19 @@ def test_mock_examples_are_deterministic_and_follow_conversation_schema():
     assert first[0]["conversation"][0]["content"][0]["image"].size == (8, 6)
 
 
+def test_mock_examples_add_deterministic_audio_clips_after_images():
+    config = _config(random_seed=3, num_images=2, image_size=(8, 6), num_audios=2, audio_seconds=0.5)
+
+    first = builder_module.make_mock_vlm_examples(config)
+    second = builder_module.make_mock_vlm_examples(config)
+
+    content = first[0]["conversation"][0]["content"]
+    assert [item["type"] for item in content] == ["image", "image", "audio", "audio", "text"]
+    clip = content[2]["audio"]
+    assert clip.dtype.name == "float32" and clip.shape == (8000,)
+    assert (clip == second[0]["conversation"][0]["content"][2]["audio"]).all()
+
+
 def test_builder_loads_processor_at_runtime_and_builds_requested_splits(monkeypatch: pytest.MonkeyPatch):
     config = _config(
         enable_in_batch_packing=True,
@@ -135,6 +148,8 @@ def test_builder_collates_super_vl_processor_with_nemotron_omni_collator(monkeyp
         ({"num_images": -1}, "num_images"),
         ({"image_size": (0, 16)}, "image_size"),
         ({"pad_to_multiple_of": 0}, "pad_to_multiple_of"),
+        ({"num_audios": -1}, "num_audios"),
+        ({"num_audios": 1, "audio_seconds": 0.0}, "audio_seconds"),
     ],
 )
 def test_mock_config_rejects_invalid_values(overrides, error):

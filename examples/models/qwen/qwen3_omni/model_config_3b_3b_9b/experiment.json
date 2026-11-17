@@ -1,0 +1,72 @@
+{
+  "exported_on": "2026-11-16",
+  "base_model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+  "source": [
+    "/data1/wanghuibing/Megatron-Bridge/examples/models/qwen/qwen3_omni/README.benchmark.md",
+    "/data1/wanghuibing/Megatron-Bridge/examples/models/qwen/qwen3_omni/omni_benchmark.py",
+    "/data1/wanghuibing/Megatron-Bridge/examples/models/qwen/qwen3_omni/compare_training.py"
+  ],
+  "model_size": "3b-3b-9b",
+  "scope": "thinker only; vision + audio + dense LLM",
+  "initialization": "random; no weights included",
+  "variants": {
+    "documented_benchmark": {
+      "file": "config.json",
+      "vision_heads": 21,
+      "audio_heads": 20,
+      "vision_head_dim": 128,
+      "audio_head_dim": 128
+    },
+    "current_script": {
+      "file": "config.current.json",
+      "vision_heads": 24,
+      "audio_heads": 32,
+      "vision_head_dim": 112,
+      "audio_head_dim": 80
+    }
+  },
+  "parameter_counts_from_module_shapes": {
+    "vision": 2990991616,
+    "audio": 3030571136,
+    "llm": 8997191680,
+    "total": 15018754432
+  },
+  "workload": {
+    "micro_batch_size": 1,
+    "global_batch_sizes": [
+      32
+    ],
+    "sequence_lengths": [
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "media_items_per_modality_per_sample": "sequence_length / 1024",
+    "image_size": [
+      448,
+      448
+    ],
+    "patches_per_image": 784,
+    "llm_tokens_per_image": 196,
+    "audio_seconds": 15,
+    "audio_sample_rate": 16000,
+    "mel_frames_per_clip": 1500,
+    "llm_tokens_per_clip": 195,
+    "precision": "bf16_mixed",
+    "optimizer": "distributed Adam",
+    "grad_reduce_in_fp32": true,
+    "clip_grad": 0,
+    "activation_recompute": false,
+    "warmup_steps": 3,
+    "measured_steps": 5
+  },
+  "caveats": [
+    "The HF model_type contains moe, but mlp_only_layers selects dense MLPs in every LLM layer.",
+    "Bridge also requires num_moe_experts=None and moe_ffn_hidden_size=None after AutoBridge conversion.",
+    "HF text attention_dropout is 0.0; the Bridge provider inherits Megatron-Core attention_dropout=0.1. Use the latter to match training semantics.",
+    "Talker and code2wav configs are inherited metadata; they are disabled and were not benchmarked.",
+    "Parallel layout and runtime sequence length must be chosen separately; there is no single layout for the entire grid."
+  ]
+}

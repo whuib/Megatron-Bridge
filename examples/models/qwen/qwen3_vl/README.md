@@ -2,6 +2,9 @@
 
 This directory contains example scripts for Qwen 3 vision-language models.
 
+For the opt-in multiplexing runtime and a shared native / DistTrain / multiplexing
+training case, see [the multiplexing guide](README.multiplexing.md).
+
 For model introduction and architecture details, see the [Qwen 3 - VL documentation](../../../../docs/models/qwen/qwen3-vl.md).
 
 ## Workspace Configuration
