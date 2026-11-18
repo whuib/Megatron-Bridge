@@ -50,6 +50,14 @@ def _args(**overrides):
         sequence_parallel=False,
         vision_gpus=4,
         mux_encoder_schedule="interleaved",
+        mux_module_state_offload=False,
+        mux_module_state_offload_overlap=False,
+        mux_module_state_offload_budget=False,
+        mux_module_state_offload_resident_param_mib=0,
+        mux_module_state_offload_resident_optim_mib=0,
+        mux_module_state_offload_prefetch_mib=0,
+        mux_module_state_offload_writeback_chunk_mib=0,
+        mux_module_state_offload_scoped_handoff=False,
         seq_length=4096,
         global_batch_size=32,
         micro_batch_size=1,
@@ -124,6 +132,22 @@ def test_unsupported_reason_rejects_before_launch(compare):
     assert reason is not None and "divisible by 8" in reason
     native = ["--mode", "native", "--language-pp", "2", "--language-first-stage-layers", "6", *workload]
     assert compare.unsupported_reason(native, world_size=8) is None
+
+
+def test_scoped_offload_handoffs_require_matching_layouts(compare):
+    args = _args(
+        mode="multiplexing",
+        language_tp=4,
+        encoder_tp=2,
+        encoder_implementation="megatron",
+        mux_module_state_offload=True,
+        mux_module_state_offload_overlap=True,
+        mux_module_state_offload_scoped_handoff=True,
+    )
+    with pytest.raises(ValueError, match="identical encoder/language TP"):
+        compare.parallel_layout(args, world_size=8)
+    args.encoder_tp = 4
+    assert compare.parallel_layout(args, world_size=8)["mux_module_state_offload_scoped_handoff"] == 1
 
 
 def test_model_sizes_match_their_names(benchmark):

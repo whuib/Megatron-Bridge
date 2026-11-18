@@ -142,12 +142,55 @@ def parallel_layout(args: argparse.Namespace, world_size: int) -> dict[str, Any]
             )
     if args.mode == "multiplexing" and args.mux_encoder_schedule == "interleaved" and args.language_pp != 1:
         raise ValueError("--mux-encoder-schedule interleaved requires --language-pp 1")
+    offload_flags = (
+        args.mux_module_state_offload,
+        args.mux_module_state_offload_overlap,
+        args.mux_module_state_offload_budget,
+        args.mux_module_state_offload_resident_param_mib,
+        args.mux_module_state_offload_resident_optim_mib,
+        args.mux_module_state_offload_prefetch_mib,
+        args.mux_module_state_offload_writeback_chunk_mib,
+        args.mux_module_state_offload_scoped_handoff,
+    )
+    if any(offload_flags) and args.mode != "multiplexing":
+        raise ValueError("module state offload options require --mode multiplexing")
+    if args.mux_module_state_offload_overlap and not args.mux_module_state_offload:
+        raise ValueError("--mux-module-state-offload-overlap requires --mux-module-state-offload")
+    if args.mux_module_state_offload_budget and not args.mux_module_state_offload_overlap:
+        raise ValueError("--mux-module-state-offload-budget requires --mux-module-state-offload-overlap")
+    for option in ("resident_param_mib", "resident_optim_mib", "prefetch_mib", "writeback_chunk_mib"):
+        value = getattr(args, f"mux_module_state_offload_{option}")
+        flag = f"--mux-module-state-offload-{option.replace('_', '-')}"
+        if value < 0:
+            raise ValueError(f"{flag} must be nonnegative")
+        if value and (not args.mux_module_state_offload_overlap or args.mux_module_state_offload_budget):
+            raise ValueError(f"{flag} requires non-budgeted overlap")
+    if (
+        args.mux_module_state_offload_writeback_chunk_mib
+        and args.mux_module_state_offload_writeback_chunk_mib >= args.mux_module_state_offload_prefetch_mib
+    ):
+        raise ValueError("--mux-module-state-offload-writeback-chunk-mib must be smaller than the prefetch allowance")
+    if args.mux_module_state_offload_scoped_handoff:
+        if not args.mux_module_state_offload_overlap or args.mux_module_state_offload_budget:
+            raise ValueError("--mux-module-state-offload-scoped-handoff requires non-budgeted overlap")
+        if args.encoder_tp != args.language_tp or args.language_pp != 1:
+            raise ValueError(
+                "--mux-module-state-offload-scoped-handoff requires identical encoder/language TP and PP1"
+            )
     layout.update(
         language_tp=args.language_tp,
         language_pp=args.language_pp,
         language_first_stage_layers=first_stage_layers,
         sequence_parallel=int(args.sequence_parallel),
         mux_encoder_schedule=args.mux_encoder_schedule if args.mode == "multiplexing" else "n/a",
+        mux_module_state_offload=int(args.mux_module_state_offload),
+        mux_module_state_offload_overlap=int(args.mux_module_state_offload_overlap),
+        mux_module_state_offload_budget=int(args.mux_module_state_offload_budget),
+        mux_module_state_offload_resident_param_mib=args.mux_module_state_offload_resident_param_mib,
+        mux_module_state_offload_resident_optim_mib=args.mux_module_state_offload_resident_optim_mib,
+        mux_module_state_offload_prefetch_mib=args.mux_module_state_offload_prefetch_mib,
+        mux_module_state_offload_writeback_chunk_mib=args.mux_module_state_offload_writeback_chunk_mib,
+        mux_module_state_offload_scoped_handoff=int(args.mux_module_state_offload_scoped_handoff),
     )
     return layout
 
@@ -222,6 +265,14 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
             use_multiplexing=True,
             encoder_tensor_model_parallel_size=layout["encoder_tp"],
             encoder_schedule=args.mux_encoder_schedule,
+            module_state_offload=args.mux_module_state_offload,
+            module_state_offload_overlap=args.mux_module_state_offload_overlap,
+            module_state_offload_budget=args.mux_module_state_offload_budget,
+            module_state_offload_resident_param_mib=args.mux_module_state_offload_resident_param_mib,
+            module_state_offload_resident_optim_mib=args.mux_module_state_offload_resident_optim_mib,
+            module_state_offload_prefetch_mib=args.mux_module_state_offload_prefetch_mib,
+            module_state_offload_writeback_chunk_mib=args.mux_module_state_offload_writeback_chunk_mib,
+            module_state_offload_scoped_handoff=args.mux_module_state_offload_scoped_handoff,
         )
         model.multiplexing.layouts(world_size=world_size, language_tp=args.language_tp, language_pp=args.language_pp)
     optimizer, scheduler = distributed_fused_adam_with_cosine_annealing(
@@ -371,6 +422,52 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("deferred", "interleaved"),
         default="interleaved",
         help="multiplexing only; interleaved (language PP 1) keeps one micro-batch of encoder activations alive",
+    )
+    parser.add_argument(
+        "--mux-module-state-offload",
+        action="store_true",
+        help="multiplexing only; keep per-layer parameters, gradients and Adam state in pinned host memory, "
+        "copied to the GPU around each layer's work on the compute stream (no overlap)",
+    )
+    parser.add_argument(
+        "--mux-module-state-offload-overlap",
+        action="store_true",
+        help="with --mux-module-state-offload: prefetch/write back on a copy stream overlapped with compute",
+    )
+    parser.add_argument(
+        "--mux-module-state-offload-budget",
+        action="store_true",
+        help="with --mux-module-state-offload-overlap: keep parameters on the GPU and offload only the Adam "
+        "state the measured copy bandwidth hides behind the measured compute",
+    )
+    parser.add_argument(
+        "--mux-module-state-offload-resident-param-mib",
+        type=int,
+        default=0,
+        help="with non-budgeted overlap, keep up to this many MiB of module weights resident on each GPU",
+    )
+    parser.add_argument(
+        "--mux-module-state-offload-resident-optim-mib",
+        type=int,
+        default=0,
+        help="with non-budgeted overlap, keep up to this many MiB of FP32 Adam buffers on each GPU",
+    )
+    parser.add_argument(
+        "--mux-module-state-offload-prefetch-mib",
+        type=int,
+        default=0,
+        help="with non-budgeted overlap, stage up to this many extra MiB before write-back",
+    )
+    parser.add_argument(
+        "--mux-module-state-offload-writeback-chunk-mib",
+        type=int,
+        default=0,
+        help="send this many MiB of eligible Adam write-backs before the next priority upload",
+    )
+    parser.add_argument(
+        "--mux-module-state-offload-scoped-handoff",
+        action="store_true",
+        help="with identical encoder/language layouts, keep the copy stream running across handoffs",
     )
     parser.add_argument("--seq-length", type=int, default=4096)
     parser.add_argument("--global-batch-size", type=int, default=32)

@@ -36,11 +36,42 @@ class MultiplexingConfig:
 
     The encoder's activation-recompute policy is the provider's ``vision_recompute_*`` setting,
     which native and DistTrain Qwen3-VL honor in the same way.
+
+    ``module_state_offload`` keeps every module's parameters, FP32 main gradients and Adam state
+    (one module per transformer layer or remaining leaf module, see ``state_offload``) in pinned
+    host memory and copies a module's state to the GPU only around its forward, backward and
+    optimizer step, in line with the computation (one module GPU resident); each module steps right
+    after its last backward of the step. ``module_state_offload_overlap`` additionally prefetches the
+    next module and writes the previous one back on a copy stream while the current module computes
+    (the current and next modules). ``module_state_offload_resident_param_mib``
+    allows some modules' parameters to stay on the GPU throughout training with this overlap schedule.
+    The cap is per rank and applies to whole module weight buffers.
+    ``module_state_offload_resident_optim_mib`` keeps selected FP32 Adam buffers on the GPU.
+    ``module_state_offload_prefetch_mib`` bounds the extra state staged ahead of the previous
+    module's write-back and separates readiness for backward and Adam updates.
+    ``module_state_offload_writeback_chunk_mib`` defers the tail of an Adam write-back when its
+    buffer fits that allowance, allowing the next uploads to go first.
+    ``module_state_offload_scoped_handoff`` leaves state copies in flight across local
+    encoder/language handoffs. It requires identical TP layouts and non-budgeted overlap.
+
+    ``module_state_offload_budget`` keeps the predicted peak 2.8 GiB under the memory PyTorch can
+    use, which leaves a few hundred MiB free after transient workspaces. It offloads a mix of Adam
+    state, saved activations and parameters — whole modules for Adam state and parameters, and only
+    as many saved tensors as the margin requires (see ``state_budget``). Hidden copies can still
+    slow the collectives they overlap on systems where host-device DMA contends with NVLink.
     """
 
     use_multiplexing: bool = False
     encoder_tensor_model_parallel_size: int | None = None
     encoder_schedule: Literal["deferred", "interleaved"] = "deferred"
+    module_state_offload: bool = False
+    module_state_offload_overlap: bool = False
+    module_state_offload_budget: bool = False
+    module_state_offload_resident_param_mib: int = 0
+    module_state_offload_resident_optim_mib: int = 0
+    module_state_offload_prefetch_mib: int = 0
+    module_state_offload_writeback_chunk_mib: int = 0
+    module_state_offload_scoped_handoff: bool = False
 
     def layouts(
         self, *, world_size: int, language_tp: int, language_pp: int
@@ -73,13 +104,44 @@ class MultiplexingConfig:
 
     def validate(self, cfg: "ConfigContainer") -> None:
         """Reject incompatible modes before creating models or process groups."""
+        for name in (
+            "module_state_offload_resident_param_mib",
+            "module_state_offload_resident_optim_mib",
+            "module_state_offload_prefetch_mib",
+            "module_state_offload_writeback_chunk_mib",
+        ):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"multiplexing.{name} must be nonnegative")
+            if value and (not self.module_state_offload_overlap or self.module_state_offload_budget):
+                raise ValueError(f"multiplexing.{name} requires non-budgeted overlap")
+        if (
+            self.module_state_offload_writeback_chunk_mib
+            and self.module_state_offload_writeback_chunk_mib >= self.module_state_offload_prefetch_mib
+        ):
+            raise ValueError("multiplexing write-back chunk must be smaller than module_state_offload_prefetch_mib")
+        if self.module_state_offload_budget and not self.module_state_offload_overlap:
+            raise ValueError("multiplexing.module_state_offload_budget requires module_state_offload_overlap")
+        if self.module_state_offload_scoped_handoff and (
+            not self.module_state_offload_overlap or self.module_state_offload_budget
+        ):
+            raise ValueError("multiplexing.module_state_offload_scoped_handoff requires non-budgeted overlap")
+        if self.module_state_offload_overlap and not self.module_state_offload:
+            raise ValueError("multiplexing.module_state_offload_overlap requires module_state_offload")
         if not self.use_multiplexing:
+            if self.module_state_offload:
+                raise ValueError("multiplexing.module_state_offload requires use_multiplexing")
             return
         model = cfg.model
         if getattr(getattr(model, "dist_train", None), "use_dist_train", False):
             raise ValueError("multiplexing and DistTrain are mutually exclusive")
         if self.encoder_tensor_model_parallel_size is None:
             raise ValueError("Set multiplexing.encoder_tensor_model_parallel_size explicitly")
+        if (
+            self.module_state_offload_scoped_handoff
+            and self.encoder_tensor_model_parallel_size != model.tensor_model_parallel_size
+        ):
+            raise ValueError("multiplexing.module_state_offload_scoped_handoff requires identical encoder/language TP")
         if self.encoder_schedule not in ("deferred", "interleaved"):
             raise ValueError(
                 f"multiplexing.encoder_schedule must be 'deferred' or 'interleaved', got {self.encoder_schedule!r}"
@@ -121,3 +183,25 @@ class MultiplexingConfig:
         rejected = [name for name, enabled in unsupported.items() if enabled]
         if rejected:
             raise ValueError("Qwen3-VL multiplexing does not yet support: " + ", ".join(rejected))
+        if self.module_state_offload:
+            self.validate_module_state_offload(cfg)
+
+    def validate_module_state_offload(self, cfg: "ConfigContainer") -> None:
+        """Reject settings the module state offload does not handle."""
+        model, optimizer = cfg.model, cfg.optimizer
+        unsupported = {
+            "language pipeline parallelism": model.pipeline_model_parallel_size != 1,
+            "activation recompute": model.recompute_granularity is not None
+            or bool(getattr(model, "vit_gradient_checkpointing", False)),
+            "activation CPU offloading": bool(getattr(model, "cpu_offloading", False)),
+            "tied embeddings": bool(model.share_embeddings_and_output_weights),
+            "non-BF16 parameters": not model.bf16,
+            "optimizers other than Adam": optimizer.optimizer != "adam",
+            "the non-distributed optimizer": not cfg.ddp.use_distributed_optimizer,
+            "the precision-aware optimizer": bool(optimizer.use_precision_aware_optimizer),
+            "optimizer CPU offload": bool(optimizer.optimizer_cpu_offload),
+            "optimizer CUDA graphs": bool(optimizer.optimizer_cuda_graph),
+        }
+        rejected = [name for name, enabled in unsupported.items() if enabled]
+        if rejected:
+            raise ValueError("multiplexing module state offload does not support: " + ", ".join(rejected))

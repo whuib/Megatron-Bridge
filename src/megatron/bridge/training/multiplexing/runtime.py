@@ -45,15 +45,20 @@ from .bridge.input_bridge import InputPartitioner
 from .bridge.layout_bridge import LayoutBridge
 from .bridge.payload import BoundaryPayload
 from .rng import EncoderRNG
+from .state_budget import BudgetedStateOffload
+from .state_offload import ModuleStateOffload
 
 
 logger = logging.getLogger(__name__)
 
 
-def _handoff() -> None:
+def _handoff(state_offload: ModuleStateOffload | None = None) -> None:
     # Drain NCCL streams before changing grids, including under
     # CUDA_DEVICE_MAX_CONNECTIONS=1. This does not create a world barrier.
-    torch.cuda.synchronize()
+    if state_offload is None:
+        torch.cuda.synchronize()
+    else:
+        state_offload.synchronize_handoff()
 
 
 def _new_transfer(template: LayoutBridge) -> LayoutBridge:
@@ -84,7 +89,16 @@ def _all_finite(models: list) -> bool:
 
 
 def _encode(
-    batch: dict, *, adapter, encoder, encoder_config, templates, partitioner, encoder_rng, language_module
+    batch: dict,
+    *,
+    adapter,
+    encoder,
+    encoder_config,
+    templates,
+    partitioner,
+    encoder_rng,
+    language_module,
+    state_offload: ModuleStateOffload | None,
 ) -> tuple[list[LayoutBridge], list[torch.Tensor]]:
     """Run one micro-batch's encoder forward and hand every boundary stream to the language ranks."""
     ratio = templates[0].src_layout.dp_size // templates[0].dest_layout.dp_size
@@ -98,16 +112,16 @@ def _encode(
         )
     scattered = []
     for data, grid in inputs:
-        _handoff()
+        _handoff(state_offload)
         scattered.append(partitioner.scatter_vision_inputs(data, grid))
-    _handoff()
+    _handoff(state_offload)
     with encoder_rng.activate():
         outputs = adapter.run_encoder(encoder, scattered)
     transfers, payloads = [], []
     for template, tensors in zip(templates, outputs, strict=True):
         payload = BoundaryPayload.from_tensor_list([tensor.detach() for tensor in tensors], -1, tensors[0].shape[0])
         transfer = _new_transfer(template)
-        _handoff()
+        _handoff(state_offload)
         transfer.forward_send(payload)
         received = transfer.forward_recv()
         # Even an identity transfer must cut the autograd edge and expose leaves.
@@ -125,7 +139,12 @@ def _encode(
 
 
 def _encoder_backward(
-    transfers: list[LayoutBridge], tensors: list[torch.Tensor], *, ratio: float, encoder_rng
+    transfers: list[LayoutBridge],
+    tensors: list[torch.Tensor],
+    *,
+    ratio: float,
+    encoder_rng,
+    state_offload: ModuleStateOffload | None,
 ) -> None:
     """Return one micro-batch's boundary gradients to the encoder ranks and run its backward."""
     encoder_grads = []
@@ -138,7 +157,7 @@ def _encoder_backward(
         )
         transfer.backward_send(grads)
         encoder_grads.extend(transfer.backward_recv())
-    _handoff()
+    _handoff(state_offload)
     # Compensate the different encoder DP averaging denominator. Under full vision recompute the
     # native encoder returns DeepStack features without autograd history, so (as in the native and
     # DistTrain paths) they contribute no encoder gradient.
@@ -149,7 +168,7 @@ def _encoder_backward(
         raise RuntimeError("multiplexing encoder produced no differentiable boundary tensor")
     with encoder_rng.activate():
         torch.autograd.backward(*zip(*differentiable))
-    _handoff()
+    _handoff(state_offload)
 
 
 class _FetchedBatches:
@@ -171,17 +190,29 @@ class _FetchedBatches:
 
 
 def _step(
-    state, output, adapter, encoder, encoder_optimizer, encoder_pgs, templates, partitioner, encoder_rng
+    state,
+    output,
+    adapter,
+    encoder,
+    encoder_optimizer,
+    encoder_pgs,
+    templates,
+    partitioner,
+    encoder_rng,
+    state_offload: ModuleStateOffload | None,
 ) -> tuple[float, int, float]:
     cfg = state.cfg
     language = output.model
     language_config = get_model_config(language[0])
     encoder_config = get_model_config(encoder[0])
     interleaved = cfg.model.multiplexing.encoder_schedule == "interleaved"
-    for model in (*encoder, *language):
-        model.zero_grad_buffer()
-    for optimizer in (encoder_optimizer, output.optimizer):
-        optimizer.zero_grad()
+    if state_offload is None:
+        for model in (*encoder, *language):
+            model.zero_grad_buffer()
+        for optimizer in (encoder_optimizer, output.optimizer):
+            optimizer.zero_grad()
+    else:
+        state_offload.begin_step()
     count = get_num_microbatches()
     # The deferred schedule encodes every micro-batch before the language phase, so it needs them all
     # up front. The interleaved schedule fetches each micro-batch right before encoding it, as native
@@ -204,7 +235,15 @@ def _step(
             partitioner=partitioner,
             encoder_rng=encoder_rng,
             language_module=language_module,
+            state_offload=state_offload,
         )
+
+    def backward(transfers: list[LayoutBridge], tensors: list[torch.Tensor]) -> None:
+        _encoder_backward(transfers, tensors, ratio=ratio, encoder_rng=encoder_rng, state_offload=state_offload)
+
+    def mark_final_microbatch(iterator: _FetchedBatches) -> None:
+        if state_offload is not None and iterator.index == count - 1:
+            state_offload.final_microbatch()
 
     # (per-stream transfers, encoder outputs) per micro-batch whose encoder backward has not run yet.
     encoded: list[tuple[list[LayoutBridge], list[torch.Tensor]]] = []
@@ -217,18 +256,20 @@ def _step(
                 # i - 1's encoder backward first, so at most one micro-batch of encoder activations
                 # is alive, then fetch and encode micro-batch i right before the language consumes it.
                 if encoded:
-                    _encoder_backward(*encoded.pop(), ratio=ratio, encoder_rng=encoder_rng)
+                    backward(*encoded.pop())
+                mark_final_microbatch(iterator)
                 batches.append(next(output.train_data_iterator))
                 encoded.append(encode(batches[-1]))
-                _handoff()
+                _handoff(state_offload)
                 return adapter.forward_step(state, iterator, model)
 
         else:
             for batch in batches:
                 encoded.append(encode(batch))
-            _handoff()
+            _handoff(state_offload)
 
             def language_step(iterator, model):
+                mark_final_microbatch(iterator)
                 return adapter.forward_step(state, iterator, model)
 
         # Deferred encoder backward and DP synchronization belong to this runtime.
@@ -250,29 +291,33 @@ def _step(
             p2p_communicator=P2PCommunicator(output.pg_collection.pp, language_config),
             pg_collection=output.pg_collection,
         )
-        _handoff()
+        _handoff(state_offload)
         if language_module is not None and adapter.pending(language_module):
             raise RuntimeError("language schedule did not consume every multiplexing boundary")
         if interleaved and (len(encoded) != 1 or len(batches) != count):
             raise RuntimeError("interleaved multiplexing schedule did not encode every micro-batch")
         # Deferred: reverse micro-batch order. Interleaved: only the last micro-batch remains.
         while encoded:
-            _encoder_backward(*encoded.pop(), ratio=ratio, encoder_rng=encoder_rng)
-        finalize_model_grads(encoder, pg_collection=encoder_pgs)
-        _handoff()
-        finalize_model_grads(language, pg_collection=output.pg_collection)
-        _handoff()
-        # With check_for_nan_in_grad, both DDPs already rejected NaN/Inf grads (fatally) while
-        # finalizing above, before either optimizer stepped; avoid a second full-gradient scan.
-        if not cfg.ddp.check_for_nan_in_grad and not _all_finite([*encoder, *language]):
-            raise FloatingPointError("non-finite multiplexing gradients; neither optimizer was updated")
-        squared_norm = 0.0
-        for optimizer in (encoder_optimizer, output.optimizer):
-            success, grad_norm, _ = optimizer.step()
-            if not success:
-                raise RuntimeError("multiplexing optimizer unexpectedly skipped a finite-gradient step")
-            if grad_norm is not None:
-                squared_norm += grad_norm * grad_norm
+            backward(*encoded.pop())
+        if state_offload is None:
+            finalize_model_grads(encoder, pg_collection=encoder_pgs)
+            _handoff()
+            finalize_model_grads(language, pg_collection=output.pg_collection)
+            _handoff()
+            # With check_for_nan_in_grad, both DDPs already rejected NaN/Inf grads (fatally) while
+            # finalizing above, before either optimizer stepped; avoid a second full-gradient scan.
+            if not cfg.ddp.check_for_nan_in_grad and not _all_finite([*encoder, *language]):
+                raise FloatingPointError("non-finite multiplexing gradients; neither optimizer was updated")
+            squared_norm = 0.0
+            for optimizer in (encoder_optimizer, output.optimizer):
+                success, grad_norm, _ = optimizer.step()
+                if not success:
+                    raise RuntimeError("multiplexing optimizer unexpectedly skipped a finite-gradient step")
+                if grad_norm is not None:
+                    squared_norm += grad_norm * grad_norm
+        else:
+            squared_norm = state_offload.end_step() ** 2
+            _handoff()
         # Telemetry only: the native forward step/schedule owns loss normalization.
         total_tokens = sum(batch["loss_mask"].sum().to(device="cuda", dtype=torch.float32) for batch in batches)
         dist.all_reduce(total_tokens, group=output.pg_collection.dp)
@@ -336,6 +381,7 @@ def pretrain_multiplexing(
     state.cfg = cfg
     owns_world = not dist.is_initialized()
     output = None
+    state_offload = None
     try:
         output = setup(state, get_dataset_provider(cfg.dataset))
         encoder_layout, language_layout = cfg.model.multiplexing.layouts(
@@ -378,6 +424,31 @@ def pretrain_multiplexing(
             use_gloo_process_groups=False,
             pg_collection=encoder_pgs,
         )
+        multiplexing = cfg.model.multiplexing
+        if multiplexing.module_state_offload:
+            offloaded = [
+                ("encoder", encoder, encoder_optimizer, encoder_pgs),
+                ("language", output.model, output.optimizer, output.pg_collection),
+            ]
+            if multiplexing.module_state_offload_budget:
+                # 2.8 GiB under the allocator limit. The output projection allocates about 2.3 GiB that
+                # the per-hook profile misses, so the step still has a few hundred MiB free after it.
+                state_offload = BudgetedStateOffload.from_megatron(offloaded, headroom_bytes=2800 * 2**20)
+            else:
+                state_offload = ModuleStateOffload.from_megatron(
+                    offloaded,
+                    overlap=multiplexing.module_state_offload_overlap,
+                    resident_param_bytes=multiplexing.module_state_offload_resident_param_mib * 2**20,
+                    resident_optim_bytes=multiplexing.module_state_offload_resident_optim_mib * 2**20,
+                    prefetch_bytes=multiplexing.module_state_offload_prefetch_mib * 2**20,
+                    writeback_chunk_bytes=multiplexing.module_state_offload_writeback_chunk_mib * 2**20,
+                    scoped_handoff=multiplexing.module_state_offload_scoped_handoff,
+                )
+            logger.info(
+                "multiplexing module state offloaded: %.1f GiB allocated, %.1f GiB reserved",
+                torch.cuda.memory_allocated() / 2**30,
+                torch.cuda.memory_reserved() / 2**30,
+            )
         # One boundary transfer per encoder output stream (e.g. vision+DeepStack, audio).
         templates = [
             LayoutBridge(
@@ -390,6 +461,10 @@ def pretrain_multiplexing(
             )
             for n_deepstack in adapter.streams
         ]
+        if multiplexing.module_state_offload_scoped_handoff and any(
+            template.needs_cross_grid_sync() for template in templates
+        ):
+            raise ValueError("Scoped module offload handoffs require local encoder/language transport on every rank")
         partitioner = InputPartitioner(language_layout, encoder_layout)
         models = [*encoder, *output.model]
         context = {"state": state, "model": models, "optimizer": output.optimizer, "scheduler": output.scheduler}
@@ -402,7 +477,16 @@ def pretrain_multiplexing(
             start = time.perf_counter()
             _fire(callback_manager, "on_train_step_start", **context)
             loss, tokens, grad_norm = _step(
-                state, output, adapter, encoder, encoder_optimizer, encoder_pgs, templates, partitioner, encoder_rng
+                state,
+                output,
+                adapter,
+                encoder,
+                encoder_optimizer,
+                encoder_pgs,
+                templates,
+                partitioner,
+                encoder_rng,
+                state_offload,
             )
             for scheduler in (output.scheduler, encoder_scheduler):
                 scheduler.step(increment=cfg.train.global_batch_size)
@@ -437,8 +521,16 @@ def pretrain_multiplexing(
                     tokens,
                     int(stats[1].item()),
                 )
+                if state_offload is not None:
+                    logger.info(
+                        "multiplexing module state offload iteration=%d %s",
+                        step + 1,
+                        " ".join(f"{name}={value:.2f}" for name, value in state_offload.step_summary().items()),
+                    )
         _fire(callback_manager, "on_train_end", **context)
         _finish_train(state, output.checkpoint_manager)
+        if state_offload is not None:
+            state_offload.close()
     except BaseException as error:
         # Same teardown as native pretrain: peers may be blocked in a collective, so abort.
         logger.exception(
