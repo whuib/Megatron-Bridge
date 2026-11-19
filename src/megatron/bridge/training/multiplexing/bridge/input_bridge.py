@@ -103,6 +103,8 @@ class InputPartitioner:
             for rank in range(src_layout.world_size)
         )
         self._bridge: Optional[LayoutBridge] = None
+        # An identity partition keeps every rank's own shard and issues no collective.
+        self.needs_communication = not self._identity
         if not self._identity:
             if src_layout.dp_size % dest_layout.dp_size != 0 and dest_layout.dp_size % src_layout.dp_size != 0:
                 raise ValueError(

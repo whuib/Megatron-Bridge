@@ -47,6 +47,7 @@ def _args(**overrides):
         language_first_stage_layers=None,
         encoder_implementation="huggingface",
         encoder_tp=1,
+        audio_encoder_tp=None,
         sequence_parallel=False,
         vision_gpus=4,
         mux_encoder_schedule="interleaved",
@@ -55,12 +56,15 @@ def _args(**overrides):
         mux_module_state_offload_budget=False,
         mux_module_state_offload_resident_param_mib=0,
         mux_module_state_offload_resident_optim_mib=0,
+        mux_module_state_offload_recompute_mlp_layers=0,
         mux_module_state_offload_prefetch_mib=0,
         mux_module_state_offload_writeback_chunk_mib=0,
         mux_module_state_offload_scoped_handoff=False,
+        mux_skip_local_handoff=False,
         seq_length=4096,
         global_batch_size=32,
         micro_batch_size=1,
+        micro_batch_sizes=None,
         media_per_sample=None,
     )
     values.update(overrides)
@@ -134,6 +138,26 @@ def test_unsupported_reason_rejects_before_launch(compare):
     assert compare.unsupported_reason(native, world_size=8) is None
 
 
+def test_unequal_microbatches_require_a_resident_interleaved_step(compare):
+    args = _args(
+        mode="multiplexing",
+        model_size="3b-3b-9b",
+        encoder_implementation="megatron",
+        language_tp=8,
+        encoder_tp=8,
+        micro_batch_sizes=[24, 8],
+    )
+    layout = compare.parallel_layout(args, world_size=8)
+    compare.validate_workload(args, layout)
+    args.micro_batch_sizes = [24, 7]
+    with pytest.raises(ValueError, match="sum to --global-batch-size"):
+        compare.validate_workload(args, layout)
+    args.micro_batch_sizes = [24, 8]
+    args.mux_module_state_offload = True
+    with pytest.raises(ValueError, match="resident state"):
+        compare.validate_workload(args, layout)
+
+
 def test_scoped_offload_handoffs_require_matching_layouts(compare):
     args = _args(
         mode="multiplexing",
@@ -148,6 +172,20 @@ def test_scoped_offload_handoffs_require_matching_layouts(compare):
         compare.parallel_layout(args, world_size=8)
     args.encoder_tp = 4
     assert compare.parallel_layout(args, world_size=8)["mux_module_state_offload_scoped_handoff"] == 1
+
+
+def test_skip_local_handoff_is_a_multiplexing_option(compare):
+    args = _args(mode="native", mux_skip_local_handoff=True)
+    with pytest.raises(ValueError, match="requires --mode multiplexing"):
+        compare.parallel_layout(args, world_size=8)
+    args = _args(
+        mode="multiplexing",
+        language_tp=4,
+        encoder_tp=4,
+        encoder_implementation="megatron",
+        mux_skip_local_handoff=True,
+    )
+    assert compare.parallel_layout(args, world_size=8)["mux_skip_local_handoff"] == 1
 
 
 def test_model_sizes_match_their_names(benchmark):

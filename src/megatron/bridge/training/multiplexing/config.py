@@ -37,6 +37,10 @@ class MultiplexingConfig:
     The encoder's activation-recompute policy is the provider's ``vision_recompute_*`` setting,
     which native and DistTrain Qwen3-VL honor in the same way.
 
+    ``micro_batch_sizes`` optionally fixes the ordered sizes for gradient accumulation in one step.
+    The sizes sum to the global batch for language DP1. The interleaved schedule collates each group
+    independently and normalizes its contribution by the full step's valid-token count.
+
     ``module_state_offload`` keeps every module's parameters, FP32 main gradients and Adam state
     (one module per transformer layer or remaining leaf module, see ``state_offload``) in pinned
     host memory and copies a module's state to the GPU only around its forward, backward and
@@ -47,12 +51,19 @@ class MultiplexingConfig:
     allows some modules' parameters to stay on the GPU throughout training with this overlap schedule.
     The cap is per rank and applies to whole module weight buffers.
     ``module_state_offload_resident_optim_mib`` keeps selected FP32 Adam buffers on the GPU.
+    ``module_state_offload_recompute_mlp_layers`` checkpoints the dense MLPs of the first
+    specified number of language layers. It can free activation memory for resident Adam state.
     ``module_state_offload_prefetch_mib`` bounds the extra state staged ahead of the previous
     module's write-back and separates readiness for backward and Adam updates.
     ``module_state_offload_writeback_chunk_mib`` defers the tail of an Adam write-back when its
     buffer fits that allowance, allowing the next uploads to go first.
     ``module_state_offload_scoped_handoff`` leaves state copies in flight across local
     encoder/language handoffs. It requires identical TP layouts and non-budgeted overlap.
+
+    ``skip_local_handoff`` drops the device-wide drain between the encoder, boundary and language
+    phases when the encoder and language layouts are identical (every boundary is local), so the host
+    can queue the next phase while the GPU finishes the previous one. It has no effect with module
+    state offload, with different layouts, or under ``CUDA_DEVICE_MAX_CONNECTIONS=1``.
 
     ``module_state_offload_budget`` keeps the predicted peak 2.8 GiB under the memory PyTorch can
     use, which leaves a few hundred MiB free after transient workspaces. It offloads a mix of Adam
@@ -63,15 +74,20 @@ class MultiplexingConfig:
 
     use_multiplexing: bool = False
     encoder_tensor_model_parallel_size: int | None = None
+    # None keeps the audio tower on the vision encoder's TP group.
+    audio_tensor_model_parallel_size: int | None = None
     encoder_schedule: Literal["deferred", "interleaved"] = "deferred"
     module_state_offload: bool = False
     module_state_offload_overlap: bool = False
     module_state_offload_budget: bool = False
     module_state_offload_resident_param_mib: int = 0
     module_state_offload_resident_optim_mib: int = 0
+    module_state_offload_recompute_mlp_layers: int = 0
     module_state_offload_prefetch_mib: int = 0
     module_state_offload_writeback_chunk_mib: int = 0
     module_state_offload_scoped_handoff: bool = False
+    micro_batch_sizes: tuple[int, ...] | None = None
+    skip_local_handoff: bool = False
 
     def layouts(
         self, *, world_size: int, language_tp: int, language_pp: int
@@ -98,15 +114,34 @@ class MultiplexingConfig:
             dp_size=world_size // (language_tp * language_pp),
             dimension_order="tp-cp-dp-pp",
         )
-        if encoder.dp_size % language.dp_size:
-            raise ValueError("Qwen3-VL multiplexing requires encoder DP to be a multiple of language DP")
+        if encoder.dp_size % language.dp_size and language.dp_size % encoder.dp_size:
+            raise ValueError("Qwen3-VL multiplexing requires encoder DP and language DP to divide each other")
         return encoder, language
+
+    def audio_layout(self, *, world_size: int, language_dp: int) -> ModuleParallelLayout:
+        """Layout of the audio tower. It shares the vision encoder layout unless its TP is set."""
+        audio_tp = self.audio_tensor_model_parallel_size or self.encoder_tensor_model_parallel_size
+        if not isinstance(audio_tp, int) or isinstance(audio_tp, bool) or audio_tp < 1:
+            raise ValueError("multiplexing audio TP must be an explicit positive integer")
+        if world_size % audio_tp:
+            raise ValueError("multiplexing audio TP must divide world_size")
+        audio = ModuleParallelLayout(
+            "audio",
+            world_size,
+            tp_size=audio_tp,
+            dp_size=world_size // audio_tp,
+            dimension_order="tp-cp-dp-pp",
+        )
+        if audio.dp_size % language_dp and language_dp % audio.dp_size:
+            raise ValueError("Qwen3-Omni multiplexing requires audio DP and language DP to divide each other")
+        return audio
 
     def validate(self, cfg: "ConfigContainer") -> None:
         """Reject incompatible modes before creating models or process groups."""
         for name in (
             "module_state_offload_resident_param_mib",
             "module_state_offload_resident_optim_mib",
+            "module_state_offload_recompute_mlp_layers",
             "module_state_offload_prefetch_mib",
             "module_state_offload_writeback_chunk_mib",
         ):
@@ -131,8 +166,27 @@ class MultiplexingConfig:
         if not self.use_multiplexing:
             if self.module_state_offload:
                 raise ValueError("multiplexing.module_state_offload requires use_multiplexing")
+            if self.micro_batch_sizes is not None:
+                raise ValueError("multiplexing.micro_batch_sizes requires use_multiplexing")
             return
         model = cfg.model
+        if self.micro_batch_sizes is not None:
+            if not self.micro_batch_sizes or any(type(size) is not int or size < 1 for size in self.micro_batch_sizes):
+                raise ValueError("multiplexing.micro_batch_sizes must contain positive integers")
+            if sum(self.micro_batch_sizes) != cfg.train.global_batch_size:
+                raise ValueError("multiplexing.micro_batch_sizes must sum to global_batch_size")
+            if self.encoder_schedule != "interleaved" or self.module_state_offload:
+                raise ValueError("multiplexing.micro_batch_sizes requires the interleaved resident-state schedule")
+            if (
+                model.recompute_granularity is not None
+                or getattr(model, "vision_recompute_granularity", None) not in (None, "inherit")
+                or getattr(model, "vit_gradient_checkpointing", False)
+                or getattr(model, "cpu_offloading", False)
+                or cfg.optimizer.optimizer_cpu_offload
+            ):
+                raise ValueError("multiplexing.micro_batch_sizes keeps activations and optimizer state on device")
+            if getattr(cfg.dataset, "dataloader_type", None) == "external":
+                raise ValueError("multiplexing.micro_batch_sizes requires a dataset collate function")
         if getattr(getattr(model, "dist_train", None), "use_dist_train", False):
             raise ValueError("multiplexing and DistTrain are mutually exclusive")
         if self.encoder_tensor_model_parallel_size is None:
@@ -189,6 +243,13 @@ class MultiplexingConfig:
     def validate_module_state_offload(self, cfg: "ConfigContainer") -> None:
         """Reject settings the module state offload does not handle."""
         model, optimizer = cfg.model, cfg.optimizer
+        if self.module_state_offload_recompute_mlp_layers and (
+            self.module_state_offload_recompute_mlp_layers > model.num_layers
+            or getattr(model, "mlp_chunks_for_training", 1) > 1
+        ):
+            raise ValueError(
+                "Module offload MLP recompute requires enough language layers and unchunked training MLPs"
+            )
         unsupported = {
             "language pipeline parallelism": model.pipeline_model_parallel_size != 1,
             "activation recompute": model.recompute_granularity is not None

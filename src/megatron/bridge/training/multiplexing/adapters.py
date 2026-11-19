@@ -57,6 +57,10 @@ class Qwen3VLAdapter:
             return None
         return [(inputs["pixel_values"].to(device="cuda", dtype=dtype), inputs["image_grid_thw"].cuda())]
 
+    def language_batch(self, batch: dict) -> dict:
+        """The batch the language step reads. Qwen3-VL's language model reads only the grids."""
+        return batch
+
     def run_encoder(self, encoder: list, inputs: list[tuple[torch.Tensor, torch.Tensor]]) -> list[list[torch.Tensor]]:
         """Encode this rank's image shard."""
         (pixels, grid) = inputs[0]
@@ -127,6 +131,22 @@ class Qwen3OmniAdapter:
             (pixels.to(device="cuda", dtype=dtype), grid.cuda()),
             (audio.to(device="cuda", dtype=dtype), audio_grid.to(device="cuda", dtype=torch.long)),
         ]
+
+    # The language thinker reads the media only for their grids and lengths (mRoPE indices, placeholder
+    # counts); the encoder already consumed the pixels and mel features, so they must not be copied to the
+    # device a second time (about 85 MiB per micro-batch of 16 samples, over the same PCIe link as NCCL).
+    # The thinker still tests ``is not None`` to decide whether to inject the delivered features, so the
+    # tensors are replaced by empty placeholders instead of being removed.
+    _ENCODER_ONLY_KEYS = ("pixel_values", "input_features")
+
+    def language_batch(self, batch: dict) -> dict:
+        """The batch for the language step: grids, lengths and masks stay, raw media become empty tensors."""
+        if not any(batch.get(key) is not None for key in self._ENCODER_ONLY_KEYS):
+            return batch
+        return {
+            key: torch.empty(0) if key in self._ENCODER_ONLY_KEYS and value is not None else value
+            for key, value in batch.items()
+        }
 
     def run_encoder(self, encoder: list, inputs: list[tuple[torch.Tensor, torch.Tensor]]) -> list[list[torch.Tensor]]:
         """Encode this rank's image and audio shards."""

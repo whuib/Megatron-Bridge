@@ -36,6 +36,8 @@ import torch.distributed as dist
 from torch import nn
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from .recompute_plan import resident_indices
+
 
 logger = logging.getLogger(__name__)
 
@@ -363,17 +365,17 @@ class ModuleStateOffload:
             return 0
         # Prefer later registered modules for equal-size Adam buffers, so the output projection's
         # optimizer state can be ready at the start of backward.
-        units = reversed(self._units) if component == _OPTIM else self._units
-        used = 0
-        for unit in sorted(units, key=lambda unit: unit.numel, reverse=True):
-            size = unit.numel * width
-            if size <= budget - used:
-                unit.persistent.add(component)
-                used += size
-        return used
+        units = self._units[::-1] if component == _OPTIM else self._units
+        sizes = [unit.numel * width for unit in units]
+        selected = list(resident_indices(sizes, budget))
+        for index in selected:
+            units[index].persistent.add(component)
+        return sum(sizes[index] for index in selected)
 
     def _log_setup(self) -> None:
         largest = max(self._units, key=lambda unit: unit.numel)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Module offload Adam buffer bytes: %s", [unit.nbytes(_OPTIM) for unit in self._units])
         logger.info(
             "module state offload (%s): %d modules, %.2f GiB pinned host state, largest module %s %.1f MiB, "
             "%.1f MiB resident parameters, %.1f MiB resident Adam state",
@@ -394,11 +396,14 @@ class ModuleStateOffload:
         return summary
 
     @classmethod
-    def from_megatron(cls, models: list[tuple[str, list, Any, Any]], **options: Any) -> "ModuleStateOffload":
+    def from_megatron(
+        cls, models: list[tuple[str, list, Any, Any]], *, recompute_mlp_layers: int = 0, **options: Any
+    ) -> "ModuleStateOffload":
         """Adopt DDP-wrapped Megatron models and their distributed optimizers.
 
         Args:
             models: ``(name, model chunks, optimizer, pg_collection)`` per model, one chunk each.
+            recompute_mlp_layers: Number of leading language MLPs to checkpoint, inside the offloaded layers.
             **options: Keyword arguments of the engine's constructor (e.g. ``overlap``).
 
         Returns:
@@ -407,6 +412,8 @@ class ModuleStateOffload:
         """
         from megatron.core.utils import get_model_config, unwrap_model
 
+        if recompute_mlp_layers < 0 or (recompute_mlp_layers and not options.get("overlap")):
+            raise ValueError("recompute_mlp_layers must be nonnegative and requires overlap when positive")
         described = []
         for name, chunks, optimizer, pg_collection in models:
             if len(chunks) != 1:
@@ -430,6 +437,29 @@ class ModuleStateOffload:
                     sequence_parallel=bool(config.sequence_parallel),
                     qk_layernorm=bool(config.qk_layernorm),
                 )
+            )
+        if recompute_mlp_layers:
+            from megatron.core.transformer.transformer_layer import TransformerLayer
+
+            language = next((model.module for model in described if model.name == "language"), None)
+            if language is None:
+                raise ValueError("Module offload MLP recompute requires a language model")
+            layers = sorted(
+                (module for _, module in discover_modules(language) if isinstance(module, TransformerLayer)),
+                key=lambda layer: layer.layer_number,
+            )
+            selected = layers[:recompute_mlp_layers]
+            if len(selected) != recompute_mlp_layers or any(layer.is_moe_layer for layer in selected):
+                raise ValueError(
+                    "Module offload MLP recompute requires the selected dense language layers to be offload units"
+                )
+            for layer in selected:
+                # The layer's output-gradient hook loads its weights before Megatron replays the
+                # nested MLP. Checkpointing the layer itself would re-enter its offload hooks.
+                layer.recompute_mlp = True
+            logger.info(
+                "Module offload recomputes dense language MLPs in layers %s",
+                [layer.layer_number for layer in selected],
             )
         engine = cls(described, **options)
         for _, chunks, optimizer, _ in models:

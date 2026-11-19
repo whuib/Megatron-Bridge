@@ -15,7 +15,7 @@
 """One Qwen3-Omni (thinker) mock-data case for native, DistTrain and multiplexing runs.
 
 The three modes run the same model (``--model-size``, defined in ``omni_benchmark.py``), mock data,
-batch shape, precision and optimizer, with activation recompute disabled everywhere.
+batch shape, precision and optimizer. Activation recompute stays off unless ``--recompute`` is set.
 Only the encoder/language placement differs:
 
 * native: vision and audio towers inside the first language pipeline stage (language DP);
@@ -94,9 +94,23 @@ def parallel_layout(args: argparse.Namespace, world_size: int) -> dict[str, Any]
         if encoder_tp > 1 and not megatron_towers:
             raise ValueError("--encoder-tp > 1 needs --encoder-implementation megatron")
     size = MODEL_SIZES[args.model_size]
-    for tower, heads in (("vision", size["vision"]["num_heads"]), ("audio", size["audio"]["encoder_attention_heads"])):
-        if heads % encoder_tp:
-            raise ValueError(f"encoder TP {encoder_tp} does not divide the {heads} {tower} attention heads")
+    audio_tp = args.audio_encoder_tp or encoder_tp
+    head_counts = (("vision", size["vision"]["num_heads"], encoder_tp),)
+    if args.mode != "native":
+        head_counts = (
+            *head_counts,
+            ("audio", size["audio"]["encoder_attention_heads"], audio_tp),
+        )
+    else:
+        head_counts = (
+            *head_counts,
+            ("audio", size["audio"]["encoder_attention_heads"], encoder_tp),
+        )
+    for tower, heads, tp in head_counts:
+        if heads % tp:
+            raise ValueError(f"encoder TP {tp} does not divide the {heads} {tower} attention heads")
+    if args.audio_encoder_tp is not None and args.mode != "multiplexing":
+        raise ValueError("--audio-encoder-tp is only supported for multiplexing")
     if args.mode == "disttrain":
         encoder_world = args.vision_gpus
         language_world = world_size - encoder_world
@@ -123,8 +137,8 @@ def parallel_layout(args: argparse.Namespace, world_size: int) -> dict[str, Any]
         layout = {"encoder_gpus": world_size, "language_gpus": world_size, "encoder_dp": encoder_dp}
         layout["language_dp"] = language_dp
     layout.update(encoder_implementation=args.encoder_implementation, encoder_tp=encoder_tp)
-    if layout["encoder_dp"] % layout["language_dp"]:
-        raise ValueError("encoder DP must be a multiple of language DP")
+    if layout["encoder_dp"] % layout["language_dp"] and layout["language_dp"] % layout["encoder_dp"]:
+        raise ValueError("encoder DP and language DP must divide each other")
     if args.sequence_parallel and args.language_tp < 2:
         raise ValueError("--sequence-parallel requires --language-tp > 1")
     first_stage_layers = args.language_first_stage_layers
@@ -148,17 +162,26 @@ def parallel_layout(args: argparse.Namespace, world_size: int) -> dict[str, Any]
         args.mux_module_state_offload_budget,
         args.mux_module_state_offload_resident_param_mib,
         args.mux_module_state_offload_resident_optim_mib,
+        args.mux_module_state_offload_recompute_mlp_layers,
         args.mux_module_state_offload_prefetch_mib,
         args.mux_module_state_offload_writeback_chunk_mib,
         args.mux_module_state_offload_scoped_handoff,
     )
     if any(offload_flags) and args.mode != "multiplexing":
         raise ValueError("module state offload options require --mode multiplexing")
+    if args.mux_skip_local_handoff and args.mode != "multiplexing":
+        raise ValueError("--mux-skip-local-handoff requires --mode multiplexing")
     if args.mux_module_state_offload_overlap and not args.mux_module_state_offload:
         raise ValueError("--mux-module-state-offload-overlap requires --mux-module-state-offload")
     if args.mux_module_state_offload_budget and not args.mux_module_state_offload_overlap:
         raise ValueError("--mux-module-state-offload-budget requires --mux-module-state-offload-overlap")
-    for option in ("resident_param_mib", "resident_optim_mib", "prefetch_mib", "writeback_chunk_mib"):
+    for option in (
+        "resident_param_mib",
+        "resident_optim_mib",
+        "recompute_mlp_layers",
+        "prefetch_mib",
+        "writeback_chunk_mib",
+    ):
         value = getattr(args, f"mux_module_state_offload_{option}")
         flag = f"--mux-module-state-offload-{option.replace('_', '-')}"
         if value < 0:
@@ -188,9 +211,11 @@ def parallel_layout(args: argparse.Namespace, world_size: int) -> dict[str, Any]
         mux_module_state_offload_budget=int(args.mux_module_state_offload_budget),
         mux_module_state_offload_resident_param_mib=args.mux_module_state_offload_resident_param_mib,
         mux_module_state_offload_resident_optim_mib=args.mux_module_state_offload_resident_optim_mib,
+        mux_module_state_offload_recompute_mlp_layers=args.mux_module_state_offload_recompute_mlp_layers,
         mux_module_state_offload_prefetch_mib=args.mux_module_state_offload_prefetch_mib,
         mux_module_state_offload_writeback_chunk_mib=args.mux_module_state_offload_writeback_chunk_mib,
         mux_module_state_offload_scoped_handoff=int(args.mux_module_state_offload_scoped_handoff),
+        mux_skip_local_handoff=int(args.mux_skip_local_handoff),
     )
     return layout
 
@@ -205,12 +230,41 @@ def media_per_sample(args: argparse.Namespace) -> int:
 
 def validate_workload(args: argparse.Namespace, layout: dict[str, Any]) -> None:
     """Reject workloads that a mode would split into unequal encoder shards."""
-    if args.global_batch_size % (args.micro_batch_size * layout["language_dp"]):
+    sizes = args.micro_batch_sizes
+    if sizes is not None:
+        if (
+            args.mode != "multiplexing"
+            or args.mux_encoder_schedule != "interleaved"
+            or layout["language_dp"] != 1
+            or args.mux_module_state_offload
+        ):
+            raise ValueError(
+                "--micro-batch-sizes requires interleaved multiplexing with language DP1 and resident state"
+            )
+        if any(size <= 0 for size in sizes) or sum(sizes) != args.global_batch_size:
+            raise ValueError("--micro-batch-sizes must be positive and sum to --global-batch-size")
+    elif args.global_batch_size % (args.micro_batch_size * layout["language_dp"]):
         raise ValueError("global batch size must divide evenly into micro-batch size * language DP")
-    ratio = layout["encoder_dp"] // layout["language_dp"]
-    items = args.micro_batch_size * media_per_sample(args)
-    if args.mode in ("disttrain", "multiplexing") and items % ratio:
-        raise ValueError(f"{args.mode} needs images (and clips) per micro-batch ({items}) divisible by {ratio}")
+    # When the encoder DP is smaller, it gathers language shards instead of splitting the local batch.
+    if layout["encoder_dp"] % layout["language_dp"] == 0:
+        ratio = layout["encoder_dp"] // layout["language_dp"]
+    else:
+        ratio = 1
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    audio_tp = args.audio_encoder_tp or layout["encoder_tp"]
+    audio_dp = world_size // audio_tp if world_size % audio_tp == 0 else layout["encoder_dp"]
+    if audio_dp % layout["language_dp"] == 0:
+        audio_ratio = audio_dp // layout["language_dp"] if args.mode == "multiplexing" else ratio
+    else:
+        audio_ratio = 1
+    for size in sizes or (args.micro_batch_size,):
+        items = size * media_per_sample(args)
+        if args.mode in ("disttrain", "multiplexing") and items % ratio:
+            raise ValueError(f"{args.mode} needs images (and clips) per micro-batch ({items}) divisible by {ratio}")
+        if args.mode == "multiplexing" and items % audio_ratio:
+            raise ValueError(
+                f"multiplexing needs clips per micro-batch ({items}) divisible by audio DP ratio {audio_ratio}"
+            )
 
 
 def build_config(args: argparse.Namespace) -> ConfigContainer:
@@ -235,11 +289,26 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
     model.freeze_vision_model = False
     model.freeze_audio_model = False
     model.encoder_implementation = args.encoder_implementation
-    # No activation recompute anywhere: the language model and both Hugging Face towers.
-    model.recompute_granularity = None
-    model.recompute_method = None
-    model.recompute_num_layers = None
-    model.vit_gradient_checkpointing = False
+    # Default is no recompute. Selective checkpoints core attention; full checkpoints every layer.
+    # Megatron towers inherit this language policy. Hugging Face towers use their own checkpoint flag.
+    if args.recompute == "none":
+        model.recompute_granularity = None
+        model.recompute_method = None
+        model.recompute_num_layers = None
+        model.vit_gradient_checkpointing = False
+    elif args.recompute == "selective":
+        model.recompute_granularity = "selective"
+        model.recompute_method = None
+        model.recompute_num_layers = None
+        model.recompute_modules = ["core_attn"]
+        model.vit_gradient_checkpointing = args.encoder_implementation == "huggingface"
+    elif args.recompute == "full":
+        model.recompute_granularity = "full"
+        model.recompute_method = "uniform"
+        model.recompute_num_layers = 1
+        model.vit_gradient_checkpointing = args.encoder_implementation == "huggingface"
+    else:
+        raise ValueError(f"unknown --recompute {args.recompute!r}")
     model.cuda_graph_impl = "none"
     model.apply_rope_fusion = False
     model.gradient_accumulation_fusion = args.gradient_accumulation_fusion
@@ -264,15 +333,19 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
         model.multiplexing = MultiplexingConfig(
             use_multiplexing=True,
             encoder_tensor_model_parallel_size=layout["encoder_tp"],
+            audio_tensor_model_parallel_size=args.audio_encoder_tp,
             encoder_schedule=args.mux_encoder_schedule,
+            micro_batch_sizes=tuple(args.micro_batch_sizes) if args.micro_batch_sizes is not None else None,
             module_state_offload=args.mux_module_state_offload,
             module_state_offload_overlap=args.mux_module_state_offload_overlap,
             module_state_offload_budget=args.mux_module_state_offload_budget,
             module_state_offload_resident_param_mib=args.mux_module_state_offload_resident_param_mib,
             module_state_offload_resident_optim_mib=args.mux_module_state_offload_resident_optim_mib,
+            module_state_offload_recompute_mlp_layers=args.mux_module_state_offload_recompute_mlp_layers,
             module_state_offload_prefetch_mib=args.mux_module_state_offload_prefetch_mib,
             module_state_offload_writeback_chunk_mib=args.mux_module_state_offload_writeback_chunk_mib,
             module_state_offload_scoped_handoff=args.mux_module_state_offload_scoped_handoff,
+            skip_local_handoff=args.mux_skip_local_handoff,
         )
         model.multiplexing.layouts(world_size=world_size, language_tp=args.language_tp, language_pp=args.language_pp)
     optimizer, scheduler = distributed_fused_adam_with_cosine_annealing(
@@ -371,7 +444,7 @@ def run_metadata(args: argparse.Namespace, layout: dict[str, Any], counts: dict[
     return {
         "mode": args.mode,
         "model": f"qwen3_omni_benchmark_{args.model_size}",
-        "label": "benchmark-only: mock image+audio data, random initialization, no activation recompute",
+        "label": f"benchmark-only: mock image+audio data, random initialization, recompute={args.recompute}",
         "parameters": counts,
         "layout": layout,
         "args": {key: value for key, value in vars(args).items() if key != "throughput_json"},
@@ -404,6 +477,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="LLM layers on the first pipeline stage (uneven split; the rest are divided evenly)",
     )
     parser.add_argument("--sequence-parallel", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--recompute",
+        choices=("none", "selective", "full"),
+        default="none",
+        help="activation recompute: selective checkpoints core attention; full checkpoints every transformer layer. "
+        "Hugging Face towers also enable gradient checkpointing. Megatron towers inherit the language policy.",
+    )
     parser.add_argument("--vision-gpus", type=int, default=4, help="DistTrain encoder (vision+audio) GPUs")
     parser.add_argument(
         "--encoder-implementation",
@@ -416,6 +496,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="DistTrain/multiplexing encoder TP (needs megatron towers when > 1); native towers use the language TP",
+    )
+    parser.add_argument(
+        "--audio-encoder-tp",
+        type=int,
+        default=None,
+        help="multiplexing only; audio-tower TP when it differs from --encoder-tp (DP is WORLD_SIZE / this TP)",
     )
     parser.add_argument(
         "--mux-encoder-schedule",
@@ -453,6 +539,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="with non-budgeted overlap, keep up to this many MiB of FP32 Adam buffers on each GPU",
     )
     parser.add_argument(
+        "--mux-module-state-offload-recompute-mlp-layers",
+        type=int,
+        default=0,
+        help="with non-budgeted overlap, checkpoint the dense MLPs of this many leading language layers",
+    )
+    parser.add_argument(
         "--mux-module-state-offload-prefetch-mib",
         type=int,
         default=0,
@@ -469,9 +561,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with identical encoder/language layouts, keep the copy stream running across handoffs",
     )
+    parser.add_argument(
+        "--mux-skip-local-handoff",
+        action="store_true",
+        help="with identical encoder/language layouts and resident state, drop the device drain between phases",
+    )
     parser.add_argument("--seq-length", type=int, default=4096)
     parser.add_argument("--global-batch-size", type=int, default=32)
-    parser.add_argument("--micro-batch-size", type=int, default=1)
+    batching = parser.add_mutually_exclusive_group()
+    batching.add_argument("--micro-batch-size", type=int, default=1)
+    batching.add_argument("--micro-batch-sizes", type=int, nargs="+", help="ordered sample counts within each step")
     parser.add_argument("--media-per-sample", type=int, help="images and clips per sample (default seq/1024)")
     parser.add_argument("--train-iters", type=int, default=13, help="total steps, including the warmup steps")
     parser.add_argument("--seed", type=int, default=1234)

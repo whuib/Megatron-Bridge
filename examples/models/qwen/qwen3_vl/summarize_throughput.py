@@ -41,9 +41,11 @@ LAYOUT_ARGS = {
     "mux_module_state_offload_budget",
     "mux_module_state_offload_resident_param_mib",
     "mux_module_state_offload_resident_optim_mib",
+    "mux_module_state_offload_recompute_mlp_layers",
     "mux_module_state_offload_prefetch_mib",
     "mux_module_state_offload_writeback_chunk_mib",
     "mux_module_state_offload_scoped_handoff",
+    "mux_skip_local_handoff",
 }
 # Megatron pads the vocabulary to a multiple of 128 * TP, so the logit FLOPs (and the model FLOPs per
 # iteration) legitimately differ by layout. Anything beyond this relative gap is a different workload.

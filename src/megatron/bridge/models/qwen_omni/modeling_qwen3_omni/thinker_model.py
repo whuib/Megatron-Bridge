@@ -279,11 +279,12 @@ class Qwen3OmniThinkerModel(MegatronModule):
             # Tensor-parallel towers over this model's TP group (language TP natively, the encoder TP
             # of DistTrain encoder ranks or the multiplexing encoder module).
             groups = pg_collection if pg_collection is not None else ProcessGroupCollection.use_mpu_process_groups()
+            audio_groups = getattr(language_transformer_config, "audio_pg_collection", None) or groups
             self.visual = Qwen3OmniVisionEncoder(
                 thinker_transformer_config.vision_config, language_transformer_config, groups
             )
             self.audio_model = Qwen3OmniAudioEncoder(
-                thinker_transformer_config.audio_config, language_transformer_config, groups
+                thinker_transformer_config.audio_config, language_transformer_config, audio_groups
             )
             if getattr(language_transformer_config, "vit_gradient_checkpointing", False):
                 raise ValueError(
@@ -446,7 +447,9 @@ class Qwen3OmniThinkerModel(MegatronModule):
     ) -> torch.Tensor:
         if feature_attention_mask is not None:
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
+            if self.audio_model is not None:
+                # A decoder-only stage consumes delivered audio embeddings and needs only the lengths.
+                input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
 
         if audio_feature_lengths is None:
             raise ValueError("Either feature_attention_mask or audio_feature_lengths must be provided")

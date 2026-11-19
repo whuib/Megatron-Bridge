@@ -39,10 +39,16 @@ def test_routes_cover_each_encoder_replica_once(world, tp, pp, encoder_tp):
     assert len(sources) == len(set(sources)) == encoder.dp_size
 
 
-@pytest.mark.parametrize("world,tp,pp,encoder_tp", [(3, 2, 1, 1), (8, 1, 1, 2), (8, 1, 2, 0)])
+@pytest.mark.parametrize("world,tp,pp,encoder_tp", [(3, 2, 1, 1), (8, 1, 2, 0), (12, 2, 1, 3)])
 def test_invalid_layouts(world, tp, pp, encoder_tp):
     with pytest.raises(ValueError):
         MultiplexingConfig(True, encoder_tp).layouts(world_size=world, language_tp=tp, language_pp=pp)
+
+
+def test_a_smaller_encoder_dp_gathers_language_replicas():
+    # Encoder DP 4 against language DP 8: each encoder replica serves two language replicas.
+    encoder, language = MultiplexingConfig(True, 2).layouts(world_size=8, language_tp=1, language_pp=1)
+    assert (encoder.dp_size, language.dp_size) == (4, 8)
 
 
 def test_rank_mapping_roundtrip():

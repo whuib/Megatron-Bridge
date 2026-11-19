@@ -17,6 +17,7 @@ from multiplexing_subject.state_budget import (
 )
 from multiplexing_subject.state_offload import ModuleStateOffload, OffloadedModel, discover_modules
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 pytestmark = pytest.mark.unit
@@ -27,9 +28,14 @@ class Block(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(width)
         self.linear = nn.Linear(width, width)
+        self.recompute = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.linear(self.norm(x))
+        normalized = self.norm(x)
+        projected = (
+            checkpoint(self.linear, normalized, use_reentrant=True) if self.recompute else self.linear(normalized)
+        )
+        return x + projected
 
 
 class Toy(nn.Module):
@@ -65,6 +71,8 @@ def test_overlap_requires_offload():
         MultiplexingConfig(module_state_offload_overlap=True).validate(object())
     with pytest.raises(ValueError, match="requires use_multiplexing"):
         MultiplexingConfig(module_state_offload=True).validate(object())
+    with pytest.raises(ValueError, match="recompute_mlp_layers requires non-budgeted overlap"):
+        MultiplexingConfig(module_state_offload_recompute_mlp_layers=1).validate(object())
 
 
 def test_offload_rejects_unsupported_settings():
@@ -230,6 +238,29 @@ def test_offloaded_training_matches_resident_training(
     for want, got in zip(expected, actual):
         assert torch.equal(want, got)
     assert resident == (2 if overlap else 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_recomputed_submodule_does_not_reenter_offload_or_repeat_adam():
+    torch.manual_seed(13)
+    model = Toy().cuda().to(torch.bfloat16)
+    reference_model = copy.deepcopy(model)
+    model.blocks[0].recompute = True
+    model.blocks[2].recompute = True
+    steps = [[torch.randn(32, 16, device="cuda", dtype=torch.bfloat16) for _ in range(count)] for count in (2, 2, 1)]
+    expected = _reference(reference_model, steps)
+    actual, _ = _offloaded(
+        model,
+        steps,
+        overlap=True,
+        resident_param_bytes=18 * 1024,
+        prefetch_bytes=64 * 1024,
+        resident_optim_bytes=58 * 1024,
+        scoped_handoff=True,
+        writeback_chunk_bytes=16 * 1024,
+    )
+    for want, got in zip(expected, actual):
+        assert torch.equal(want, got)
 
 
 def test_copy_slack_simulates_the_copy_stream():

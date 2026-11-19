@@ -15,6 +15,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -41,9 +42,10 @@ from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.train import _finish_train
 
 from .adapters import adapter_for
-from .bridge.input_bridge import InputPartitioner
+from .bridge.input_bridge import InputPartitioner, split_vision_by_images
 from .bridge.layout_bridge import LayoutBridge
 from .bridge.payload import BoundaryPayload
+from .microbatches import collate_microbatches, scale_microbatch_loss
 from .rng import EncoderRNG
 from .state_budget import BudgetedStateOffload
 from .state_offload import ModuleStateOffload
@@ -52,9 +54,13 @@ from .state_offload import ModuleStateOffload
 logger = logging.getLogger(__name__)
 
 
-def _handoff(state_offload: ModuleStateOffload | None = None) -> None:
+def _handoff(state_offload: ModuleStateOffload | None = None, *, skip: bool = False) -> None:
     # Drain NCCL streams before changing grids, including under
     # CUDA_DEVICE_MAX_CONNECTIONS=1. This does not create a world barrier.
+    # ``skip`` is only set when every boundary is local (see ``skip_local_handoff``): the module
+    # collectives are then ordered by the compute stream, so the host may run ahead.
+    if skip:
+        return
     if state_offload is None:
         torch.cuda.synchronize()
     else:
@@ -75,6 +81,49 @@ def _new_transfer(template: LayoutBridge) -> LayoutBridge:
     transfer._backward_done = False
     transfer.phase_log = []
     return transfer
+
+
+class _LocalDPSplit:
+    """Keep one DP shard of a tensor every rank already holds in full."""
+
+    needs_communication = False
+
+    def __init__(self, layout) -> None:
+        self.layout = layout
+
+    def scatter_vision_inputs(self, data: torch.Tensor, grid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.layout.dp_size == 1:
+            return data, grid
+        chunk = self.layout.local_rank("dp", dist.get_rank())
+        return split_vision_by_images(data, grid, self.layout.dp_size, chunk)
+
+
+def _boundaries_are_local(templates: list[LayoutBridge], partitioner: list) -> bool:
+    """Whether no boundary transfer or input redistribution communicates between ranks."""
+    return not any(template.needs_cross_grid_sync() for template in templates) and not any(
+        getattr(part, "needs_communication", True) for part in partitioner
+    )
+
+
+def _average_audio_data_parallel(encoder: list, group) -> None:
+    """Average audio-tower gradients across the audio DP group.
+
+    The encoder DDP group follows the vision layout. An audio tower with its own DP replicas
+    computes different clips, so its parameter gradients are averaged here after that DDP step.
+    """
+    if group is None or dist.get_world_size(group) == 1:
+        return
+    audio = unwrap_model(encoder[0]).thinker.audio_model
+    grads = [param.main_grad for param in audio.parameters() if getattr(param, "main_grad", None) is not None]
+    if not grads:
+        return
+    flat = torch.cat([grad.detach().reshape(-1) for grad in grads])
+    dist.all_reduce(flat, op=dist.ReduceOp.AVG, group=group)
+    offset = 0
+    for grad in grads:
+        count = grad.numel()
+        grad.copy_(flat[offset : offset + count].view_as(grad))
+        offset += count
 
 
 def _all_finite(models: list) -> bool:
@@ -99,29 +148,37 @@ def _encode(
     encoder_rng,
     language_module,
     state_offload: ModuleStateOffload | None,
+    local_handoff: bool = False,
 ) -> tuple[list[LayoutBridge], list[torch.Tensor]]:
     """Run one micro-batch's encoder forward and hand every boundary stream to the language ranks."""
-    ratio = templates[0].src_layout.dp_size // templates[0].dest_layout.dp_size
     inputs = adapter.encoder_inputs(batch, encoder_config.params_dtype)
-    valid = inputs is not None and all(grid.shape[0] >= ratio for _, grid in inputs)
-    valid_tensor = torch.tensor(int(valid), device="cuda", dtype=torch.int32)
-    dist.all_reduce(valid_tensor, op=dist.ReduceOp.MIN)
-    if not valid_tensor.item():
+    stream_ratios = [max(template.src_layout.dp_size // template.dest_layout.dp_size, 1) for template in templates]
+    # The shapes are host metadata, so this needs no device sync.
+    valid = inputs is not None and all(
+        grid.shape[0] >= ratio for (_, grid), ratio in zip(inputs, stream_ratios, strict=True)
+    )
+    if templates[0].dest_layout.dp_size > 1:
+        # Language DP ranks read different batches and must agree on whether to stop. With language
+        # DP 1 every rank reads the same batch, so each reaches the same verdict without a collective.
+        valid_tensor = torch.tensor(int(valid), device="cuda", dtype=torch.int32)
+        dist.all_reduce(valid_tensor, op=dist.ReduceOp.MIN)
+        valid = bool(valid_tensor.item())
+    if not valid:
         raise ValueError(
             "multiplexing requires every encoder stream in every micro-batch, with at least one item per encoder shard"
         )
     scattered = []
-    for data, grid in inputs:
-        _handoff(state_offload)
-        scattered.append(partitioner.scatter_vision_inputs(data, grid))
-    _handoff(state_offload)
+    for stream_partitioner, (data, grid) in zip(partitioner, inputs, strict=True):
+        _handoff(state_offload, skip=local_handoff)
+        scattered.append(stream_partitioner.scatter_vision_inputs(data, grid))
+    _handoff(state_offload, skip=local_handoff)
     with encoder_rng.activate():
         outputs = adapter.run_encoder(encoder, scattered)
     transfers, payloads = [], []
     for template, tensors in zip(templates, outputs, strict=True):
         payload = BoundaryPayload.from_tensor_list([tensor.detach() for tensor in tensors], -1, tensors[0].shape[0])
         transfer = _new_transfer(template)
-        _handoff(state_offload)
+        _handoff(state_offload, skip=local_handoff)
         transfer.forward_send(payload)
         received = transfer.forward_recv()
         # Even an identity transfer must cut the autograd edge and expose leaves.
@@ -142,12 +199,13 @@ def _encoder_backward(
     transfers: list[LayoutBridge],
     tensors: list[torch.Tensor],
     *,
-    ratio: float,
     encoder_rng,
     state_offload: ModuleStateOffload | None,
+    local_handoff: bool = False,
 ) -> None:
     """Return one micro-batch's boundary gradients to the encoder ranks and run its backward."""
     encoder_grads = []
+    grad_scales = []
     for transfer in transfers:
         received = transfer._recv_payload
         grads = (
@@ -156,26 +214,38 @@ def _encoder_backward(
             else [torch.zeros_like(tensor) if tensor.grad is None else tensor.grad for tensor in received.tensors()]
         )
         transfer.backward_send(grads)
-        encoder_grads.extend(transfer.backward_recv())
-    _handoff(state_offload)
+        returned = transfer.backward_recv()
+        # Undo an encoder-DP average. A smaller encoder DP gathers language replicas and does not
+        # average those gradients, so the scale stays 1.
+        src_dp, dest_dp = transfer.src_layout.dp_size, transfer.dest_layout.dp_size
+        scale = src_dp / dest_dp if src_dp % dest_dp == 0 else 1.0
+        encoder_grads.extend(returned)
+        grad_scales.extend([scale] * len(returned))
+    _handoff(state_offload, skip=local_handoff)
     # Compensate the different encoder DP averaging denominator. Under full vision recompute the
     # native encoder returns DeepStack features without autograd history, so (as in the native and
     # DistTrain paths) they contribute no encoder gradient.
     differentiable = [
-        (tensor, grad * ratio) for tensor, grad in zip(tensors, encoder_grads, strict=True) if tensor.requires_grad
+        (tensor, grad * scale)
+        for tensor, grad, scale in zip(tensors, encoder_grads, grad_scales, strict=True)
+        if tensor.requires_grad
     ]
     if not differentiable:
         raise RuntimeError("multiplexing encoder produced no differentiable boundary tensor")
     with encoder_rng.activate():
         torch.autograd.backward(*zip(*differentiable))
-    _handoff(state_offload)
+    _handoff(state_offload, skip=local_handoff)
 
 
 class _FetchedBatches:
-    """Iterate a list that may still be growing: item ``i`` must exist when it is requested."""
+    """Iterate a list that may still be growing: item ``i`` must exist when it is requested.
 
-    def __init__(self, batches: list) -> None:
+    ``transform`` maps the batch the encoder consumed to the one the language step reads.
+    """
+
+    def __init__(self, batches: list, transform: Callable[[dict], dict] | None = None) -> None:
         self.batches = batches
+        self.transform = transform
         self.index = 0
 
     def __iter__(self) -> "_FetchedBatches":
@@ -186,7 +256,7 @@ class _FetchedBatches:
             raise RuntimeError("the language schedule requested a micro-batch the encoder has not consumed")
         batch = self.batches[self.index]
         self.index += 1
-        return batch
+        return batch if self.transform is None else self.transform(batch)
 
 
 def _step(
@@ -205,7 +275,8 @@ def _step(
     language = output.model
     language_config = get_model_config(language[0])
     encoder_config = get_model_config(encoder[0])
-    interleaved = cfg.model.multiplexing.encoder_schedule == "interleaved"
+    multiplexing = cfg.model.multiplexing
+    interleaved = multiplexing.encoder_schedule == "interleaved"
     if state_offload is None:
         for model in (*encoder, *language):
             model.zero_grad_buffer()
@@ -213,17 +284,34 @@ def _step(
             optimizer.zero_grad()
     else:
         state_offload.begin_step()
-    count = get_num_microbatches()
-    # The deferred schedule encodes every micro-batch before the language phase, so it needs them all
-    # up front. The interleaved schedule fetches each micro-batch right before encoding it, as native
-    # training does, so a step never drains more batches at once than the data loader prefetches.
-    batches = [] if interleaved else [next(output.train_data_iterator) for _ in range(count)]
+    step_tokens = None
+    if multiplexing.micro_batch_sizes is not None:
+        batches = next(output.train_data_iterator)
+        count = len(multiplexing.micro_batch_sizes)
+        step_tokens = sum(int(batch["loss_mask"].sum().item()) for batch in batches)
+        if step_tokens <= 0:
+            raise ValueError("Unequal microbatches require at least one valid loss token per step")
+    else:
+        count = get_num_microbatches()
+        # The deferred schedule needs every batch up front. The interleaved schedule fetches each
+        # batch right before encoding it.
+        batches = [] if interleaved else [next(output.train_data_iterator) for _ in range(count)]
 
     raw_language = unwrap_model(language[0])
     language_module = raw_language if raw_language.pre_process else None
     if language_module is not None and adapter.pending(language_module):
         raise RuntimeError("unconsumed multiplexing boundary from the previous iteration")
-    ratio = templates[0].src_layout.dp_size / templates[0].dest_layout.dp_size
+
+    # With every boundary local (identical encoder/language layouts), no collective crosses grids:
+    # the encoder and language collectives are ordered on the compute stream, so the host may run
+    # ahead of the device and overlap its Python work with the previous phase's GPU tail.
+    local_handoff = (
+        multiplexing.skip_local_handoff
+        and state_offload is None
+        # CUDA_DEVICE_MAX_CONNECTIONS=1 serializes streams in launch order, where the drain is required.
+        and os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") != "1"
+        and _boundaries_are_local(templates, partitioner)
+    )
 
     def encode(batch: dict) -> tuple[list[LayoutBridge], list[torch.Tensor]]:
         return _encode(
@@ -236,10 +324,13 @@ def _step(
             encoder_rng=encoder_rng,
             language_module=language_module,
             state_offload=state_offload,
+            local_handoff=local_handoff,
         )
 
     def backward(transfers: list[LayoutBridge], tensors: list[torch.Tensor]) -> None:
-        _encoder_backward(transfers, tensors, ratio=ratio, encoder_rng=encoder_rng, state_offload=state_offload)
+        _encoder_backward(
+            transfers, tensors, encoder_rng=encoder_rng, state_offload=state_offload, local_handoff=local_handoff
+        )
 
     def mark_final_microbatch(iterator: _FetchedBatches) -> None:
         if state_offload is not None and iterator.index == count - 1:
@@ -258,15 +349,21 @@ def _step(
                 if encoded:
                     backward(*encoded.pop())
                 mark_final_microbatch(iterator)
-                batches.append(next(output.train_data_iterator))
-                encoded.append(encode(batches[-1]))
-                _handoff(state_offload)
-                return adapter.forward_step(state, iterator, model)
+                if step_tokens is None:
+                    batches.append(next(output.train_data_iterator))
+                encoded.append(encode(batches[iterator.index]))
+                _handoff(state_offload, skip=local_handoff)
+                result, loss_func = adapter.forward_step(state, iterator, model)
+                if step_tokens is not None:
+                    loss_func = partial(
+                        scale_microbatch_loss, loss_func=loss_func, count=count, step_tokens=step_tokens
+                    )
+                return result, loss_func
 
         else:
             for batch in batches:
                 encoded.append(encode(batch))
-            _handoff(state_offload)
+            _handoff(state_offload, skip=local_handoff)
 
             def language_step(iterator, model):
                 mark_final_microbatch(iterator)
@@ -282,7 +379,7 @@ def _step(
             forward_step_func=language_step,
             # Yields batches[i] when the language step for micro-batch i reads it (interleaved:
             # appended just before); the language consumes exactly what the encoder consumed.
-            data_iterator=_FetchedBatches(batches),
+            data_iterator=_FetchedBatches(batches, transform=adapter.language_batch),
             model=language,
             num_microbatches=count,
             seq_length=cfg.model.seq_length,
@@ -291,7 +388,7 @@ def _step(
             p2p_communicator=P2PCommunicator(output.pg_collection.pp, language_config),
             pg_collection=output.pg_collection,
         )
-        _handoff(state_offload)
+        _handoff(state_offload, skip=local_handoff)
         if language_module is not None and adapter.pending(language_module):
             raise RuntimeError("language schedule did not consume every multiplexing boundary")
         if interleaved and (len(encoded) != 1 or len(batches) != count):
@@ -301,6 +398,7 @@ def _step(
             backward(*encoded.pop())
         if state_offload is None:
             finalize_model_grads(encoder, pg_collection=encoder_pgs)
+            _average_audio_data_parallel(encoder, getattr(encoder_pgs, "audio_dp", None))
             _handoff()
             finalize_model_grads(language, pg_collection=output.pg_collection)
             _handoff()
@@ -358,11 +456,18 @@ def pretrain_multiplexing(
         raise ValueError(f"multiplexing for {type(config.model).__name__} requires {adapter.forward_step.__module__}")
     cfg = copy.deepcopy(config)
     cfg.model.multiplexing.validate(cfg)
-    cfg.model.multiplexing.layouts(
+    _, language_layout = cfg.model.multiplexing.layouts(
         world_size=dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", "1")),
         language_tp=cfg.model.tensor_model_parallel_size,
         language_pp=cfg.model.pipeline_model_parallel_size,
     )
+    micro_batch_sizes = cfg.model.multiplexing.micro_batch_sizes
+    if micro_batch_sizes is not None:
+        if language_layout.dp_size != 1:
+            raise ValueError("multiplexing.micro_batch_sizes requires language DP1")
+        # Ask the sampler for the raw samples of one optimizer step. Its collate function
+        # will split them before creating the multimodal tensors of each microbatch.
+        cfg.train.micro_batch_size = cfg.train.global_batch_size
     runtime_config_update(cfg)
     cfg.model.multiplexing.validate(cfg)
     encoder_cfg = copy.deepcopy(cfg)
@@ -382,8 +487,20 @@ def pretrain_multiplexing(
     owns_world = not dist.is_initialized()
     output = None
     state_offload = None
+    dataset_provider = get_dataset_provider(cfg.dataset)
+    if micro_batch_sizes is not None:
+        original_provider = dataset_provider
+
+        def dataset_provider(*args, **kwargs):
+            train, valid, test = original_provider(*args, **kwargs)
+            collate = getattr(train, "collate_fn", None)
+            if not callable(collate):
+                raise ValueError("Unequal microbatches require a train dataset collate function")
+            train.collate_fn = partial(collate_microbatches, sizes=micro_batch_sizes, collate=collate)
+            return train, valid, test
+
     try:
-        output = setup(state, get_dataset_provider(cfg.dataset))
+        output = setup(state, dataset_provider)
         encoder_layout, language_layout = cfg.model.multiplexing.layouts(
             world_size=dist.get_world_size(),
             language_tp=cfg.model.tensor_model_parallel_size,
@@ -398,6 +515,29 @@ def pretrain_multiplexing(
         # Vision has no language embedding shared across pipeline boundaries.
         encoder_pgs.embd = None
         encoder_pgs.pos_embd = None
+        multiplexing = cfg.model.multiplexing
+        audio_tp = multiplexing.audio_tensor_model_parallel_size
+        separate_audio = audio_tp not in (None, multiplexing.encoder_tensor_model_parallel_size)
+        if separate_audio:
+            if len(adapter.streams) < 2:
+                raise ValueError("audio encoder TP is only used by Qwen3-Omni multiplexing")
+            saved_tp = encoder_cfg.model.tensor_model_parallel_size
+            encoder_cfg.model.tensor_model_parallel_size = audio_tp
+            audio_pgs = _create_pg_collection(
+                encoder_cfg.model,
+                num_distributed_optimizer_instances=1,
+                get_embedding_ranks=None,
+                get_position_embedding_ranks=None,
+            )
+            encoder_cfg.model.tensor_model_parallel_size = saved_tp
+            encoder_cfg.model.audio_pg_collection = audio_pgs
+            encoder_pgs.audio_dp = audio_pgs.dp
+            logger.info(
+                "multiplexing audio encoder TP=%d DP=%d (vision encoder TP=%d)",
+                audio_tp,
+                dist.get_world_size(audio_pgs.dp),
+                multiplexing.encoder_tensor_model_parallel_size,
+            )
         # Encoder initialization must not perturb the language dropout streams.
         encoder_rng = EncoderRNG(seed=cfg.rng.seed, tp_rank=encoder_pgs.tp.rank())
         with encoder_rng.activate():
@@ -437,6 +577,7 @@ def pretrain_multiplexing(
             else:
                 state_offload = ModuleStateOffload.from_megatron(
                     offloaded,
+                    recompute_mlp_layers=multiplexing.module_state_offload_recompute_mlp_layers,
                     overlap=multiplexing.module_state_offload_overlap,
                     resident_param_bytes=multiplexing.module_state_offload_resident_param_mib * 2**20,
                     resident_optim_bytes=multiplexing.module_state_offload_resident_optim_mib * 2**20,
@@ -450,22 +591,31 @@ def pretrain_multiplexing(
                 torch.cuda.memory_reserved() / 2**30,
             )
         # One boundary transfer per encoder output stream (e.g. vision+DeepStack, audio).
-        templates = [
-            LayoutBridge(
-                encoder_layout,
-                language_layout,
-                hidden_size=cfg.model.hidden_size,
-                n_deepstack=n_deepstack,
-                dtype=get_model_config(encoder[0]).params_dtype,
-                replicated_destination_grads=True,
+        audio_layout = multiplexing.audio_layout(world_size=dist.get_world_size(), language_dp=language_layout.dp_size)
+        templates = []
+        for index, n_deepstack in enumerate(adapter.streams):
+            source = audio_layout if separate_audio and index == len(adapter.streams) - 1 else encoder_layout
+            templates.append(
+                LayoutBridge(
+                    source,
+                    language_layout,
+                    hidden_size=cfg.model.hidden_size,
+                    n_deepstack=n_deepstack,
+                    dtype=get_model_config(encoder[0]).params_dtype,
+                    replicated_destination_grads=True,
+                )
             )
-            for n_deepstack in adapter.streams
-        ]
         if multiplexing.module_state_offload_scoped_handoff and any(
             template.needs_cross_grid_sync() for template in templates
         ):
             raise ValueError("Scoped module offload handoffs require local encoder/language transport on every rank")
-        partitioner = InputPartitioner(language_layout, encoder_layout)
+        partitioner = []
+        for template in templates:
+            # Language DP 1 replicates the batch on every rank, so an audio DP shard is a local split.
+            if language_layout.dp_size == 1 and template.src_layout.dp_size > 1:
+                partitioner.append(_LocalDPSplit(template.src_layout))
+            else:
+                partitioner.append(InputPartitioner(language_layout, template.src_layout))
         models = [*encoder, *output.model]
         context = {"state": state, "model": models, "optimizer": output.optimizer, "scheduler": output.scheduler}
         log_interval = cfg.logger.log_interval
